@@ -1,0 +1,481 @@
+<!doctype html>
+<!--
+  THROWAWAY PROTOTYPE — answers wayfinder ticket T-filter (.scratch/tsm/issues/04-filter-search-model.md).
+  Question: does tsm's three-dimensional filter model (scope × lifecycle × search) FEEL right when you
+            actually drive it — and is multi-select safe when a filter hides rows you've selected?
+  How to run: double-click this file. Nothing to install.
+  Data: REAL rows pulled read-only from ~/.trae/cli/state_5.sqlite on 2026-08-07 (sampled: all of this
+        project + top-3 of a few other projects). Two rows tagged [DEMO-ARCHIVED] are synthetic — the
+        live DB currently has 0 archived sessions, so we fake two to exercise the lifecycle toggle.
+  This is a mock of a ratatui TUI's FILTER LOGIC, not the real thing. Lands on a throwaway branch when done.
+
+  The pure module (buildView + toggleScope/cycleLifecycle) is written to lift straight into the real
+  Rust App (App{ all_rows, view, selected, scope, lifecycle, search }). The page is a thin shell.
+-->
+<meta charset="utf-8">
+<title>tsm — T-filter (filter model) prototype</title>
+<style>
+  :root{
+    --bg:#16161e; --panel:#1a1b26; --fg:#c0caf5; --dim:#565f89;
+    --cyan:#7dcfff; --purple:#bb9af7; --green:#9ece6a; --red:#f7768e; --yellow:#e0af68;
+    --rowcur:#283457; --sel:#2d3f5f; --border:#2a2e42;
+  }
+  html,body{background:var(--bg);color:var(--fg);margin:0;
+    font-family:ui-monospace,"SF Mono",Menlo,"Cascadia Code",Consolas,monospace;}
+  .wrap{max-width:1000px;margin:0 auto;padding:20px 16px 60px;}
+  h1{font-size:16px;color:var(--purple);margin:0 0 2px;}
+  .sub{color:var(--dim);font-size:12px;margin:0 0 14px;line-height:1.55;}
+  .sub b{color:var(--cyan);font-weight:600;}
+  .q{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--purple);
+     border-radius:6px;padding:10px 12px;margin:0 0 16px;font-size:12.5px;line-height:1.6;color:var(--fg);}
+  .q b{color:var(--yellow);}
+
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px;}
+  .controls button{background:var(--panel);color:var(--fg);border:1px solid var(--border);
+    border-radius:6px;padding:6px 11px;font:inherit;font-size:12px;cursor:pointer;}
+  .controls button:hover{border-color:var(--cyan);}
+  .controls .val{color:var(--cyan);font-weight:700;}
+  .controls input{background:#0e0f16;color:var(--fg);border:1px solid var(--border);
+    border-radius:6px;padding:6px 10px;font:inherit;font-size:12px;min-width:220px;}
+  .controls input:focus{outline:none;border-color:var(--cyan);}
+  .controls label{color:var(--dim);font-size:12px;}
+
+  .statepanel{display:flex;flex-wrap:wrap;gap:14px;background:var(--panel);border:1px solid var(--border);
+    border-radius:8px;padding:10px 14px;margin-bottom:6px;font-size:12px;}
+  .statepanel .f{color:var(--dim);}
+  .statepanel .f b{color:var(--fg);font-weight:600;}
+  .statepanel .f .on{color:var(--cyan);font-weight:700;}
+  .modebar{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+    padding:8px 12px;margin-bottom:12px;font-size:12px;color:var(--dim);}
+  .modebar b{color:var(--cyan);font-weight:600;}
+  .modebar .kept{color:var(--fg);}
+
+  .term{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+    padding:10px 0;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.4);}
+  .hdr,.row{display:grid;align-items:center;column-gap:10px;padding:2px 14px;font-size:13px;white-space:nowrap;}
+  .hdr{color:var(--dim);border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:2px;}
+  .row{cursor:pointer;border-left:2px solid transparent;}
+  .row:hover{background:#1e2030;}
+  .row.cur{background:var(--rowcur);border-left-color:var(--cyan);}
+  .row.sel{background:var(--sel);}
+  .row.cur.sel{background:#31456b;}
+  .box{color:var(--dim);} .box.on{color:var(--cyan);font-weight:700;}
+  .c-upd{color:var(--dim);overflow:hidden;text-overflow:clip;}
+  .c-cwd{color:var(--cyan);overflow:hidden;text-overflow:ellipsis;}
+  .c-title{overflow:hidden;text-overflow:ellipsis;}
+  .c-title .hit{background:rgba(125,207,255,.28);color:#fff;border-radius:2px;}
+  .c-model{color:var(--dim);overflow:hidden;} .c-tok{color:var(--dim);text-align:right;}
+  .c-arch{color:var(--yellow);font-size:11px;}
+  .empty{padding:26px 14px;color:var(--dim);text-align:center;font-size:12.5px;line-height:1.7;}
+  .empty b{color:var(--yellow);}
+  .footer{display:flex;justify-content:space-between;gap:12px;border-top:1px solid var(--border);
+    margin-top:4px;padding:8px 14px 2px;color:var(--dim);font-size:11.5px;}
+  .footer .keys b{color:var(--purple);}
+  .footer .cnt b{color:var(--fg);}
+
+  .scenarios{margin-top:22px;}
+  .tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}
+  .tabs button{background:var(--panel);color:var(--fg);border:1px solid var(--border);
+    border-radius:6px 6px 0 0;padding:6px 11px;font:inherit;font-size:12px;cursor:pointer;}
+  .tabs button.on{border-color:var(--purple);color:var(--purple);border-bottom-color:var(--bg);}
+  .walk{background:var(--panel);border:1px solid var(--border);border-radius:0 8px 8px 8px;padding:12px 14px;}
+  .walk p{margin:0 0 10px;font-size:12.5px;line-height:1.6;color:var(--fg);}
+  .walk p .watch{color:var(--yellow);}
+  .steps{display:flex;flex-wrap:wrap;gap:6px;}
+  .steps button{background:#0e0f16;color:var(--fg);border:1px solid var(--border);border-radius:6px;
+    padding:6px 10px;font:inherit;font-size:12px;cursor:pointer;}
+  .steps button.done{opacity:.45;border-style:dashed;}
+  .steps button.next{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 0 1px var(--cyan) inset;}
+</style>
+
+<div class="wrap">
+  <h1>tsm — filter-model prototype (T-filter)</h1>
+  <p class="sub">
+    Drive tsm's three orthogonal filters on <b>real session data</b>. Everything is in-memory; this is a
+    mock of the <b>filter logic</b>, not the TUI look (that's the T-layout prototype).
+  </p>
+
+  <div class="q">
+    <b>Question this answers:</b> three filters stack with AND — <b>scope</b> (this&nbsp;project ↔ all),
+    <b>lifecycle</b> (active ↔ archived), <b>search</b> (case-insensitive substring over title +
+    first&nbsp;message). Default landing = <b>this project ∧ active ∧ no search</b>, sorted by recency.
+    Search is a <b>MODE</b>: <b>/</b> enters live-filter, <b>Enter</b> commits &amp; keeps the filter
+    (back to normal so p / Tab / Space work on the filtered set), <b>Esc</b> clears. Selection is kept
+    by id in a set and is <b>silently preserved</b> across filtering — a hidden selected row stays selected.
+  </div>
+
+  <!-- FREE-PLAY CONTROLS (always available, any order) -->
+  <div class="controls">
+    <button id="btn-scope">scope: <span class="val" id="v-scope"></span></button>
+    <button id="btn-life">lifecycle: <span class="val" id="v-life"></span></button>
+    <label>search /</label>
+    <input id="search" placeholder="type to filter live…" autocomplete="off">
+    <button id="btn-clear">clear search</button>
+    <button id="btn-toggle">toggle select (cursor)</button>
+    <button id="btn-invert">invert visible (*)</button>
+    <button id="btn-deselect">deselect all</button>
+  </div>
+
+  <!-- FULL STATE, re-rendered every action -->
+  <div class="statepanel" id="statepanel"></div>
+  <div class="modebar" id="modebar"></div>
+
+  <!-- THE LIST (the view the filter produces) -->
+  <div class="term">
+    <div class="hdr" id="hdr"></div>
+    <div id="list"></div>
+    <div class="footer">
+      <span class="cnt" id="cnt"></span>
+      <span class="keys" id="keys"></span>
+    </div>
+  </div>
+
+  <!-- GUIDED WALKTHROUGHS -->
+  <div class="scenarios">
+    <div class="tabs" id="tabs"></div>
+    <div class="walk">
+      <p id="walk-desc"></p>
+      <div class="steps" id="steps"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+//  PURE FILTER MODULE  — lifts into the real Rust App. No DOM in here.
+//  Mirrors App{ all_rows, view, selected, scope, lifecycle, search, mode }.
+//    scope     : "project" | "all"
+//    lifecycle : "active"  | "archived"
+//    search    : ""  => off, else case-insensitive substring
+//    mode      : "normal" | "search"   (search is a MODE: / enters, Enter commits, Esc clears)
+//  buildView is the whole filter: scope ∧ lifecycle ∧ search, then sort recency DESC.
+//  Selection is a Set<id>, applied on TOP of the view — silently preserved across filtering
+//  (a hidden selected row stays selected; no warning, by decision Q5).
+// ============================================================================
+const FilterModel = (() => {
+  const norm = s => (s || "").toLowerCase();
+
+  // scope + lifecycle = the "store query" (in real tsm this re-queries sqlite via R1 SQL).
+  // search + sort = in-memory over that snapshot (no re-query per keystroke — R1: keep reads short).
+  function buildView(allRows, projectCwd, { scope, lifecycle, search }) {
+    let rows = allRows.filter(r => {
+      const scopeOk = scope === "all" ? true : r.cwd === projectCwd;      // exact cwd equality (CONTEXT: Project)
+      const lifeOk  = lifecycle === "archived" ? r.archived === 1 : r.archived === 0;
+      return scopeOk && lifeOk;
+    });
+    const q = norm(search);
+    if (q) rows = rows.filter(r => norm(r.title).includes(q) || norm(r.fum).includes(q));
+    rows.sort((a, b) => b.updated_at_ms - a.updated_at_ms);            // recency DESC (R1: updated_at_ms)
+    return rows;
+  }
+
+  // Given the current view + selection, how many selected rows are HIDDEN by the active filter?
+  // (kept for the state panel's "N hidden" count — informational only, NOT a warning; Q5.)
+  function hiddenSelected(allRows, viewRows, selected) {
+    const visible = new Set(viewRows.map(r => r.id));
+    return [...selected].filter(id => !visible.has(id) && allRows.some(r => r.id === id));
+  }
+
+  const toggleScope     = s => (s === "project" ? "all" : "project");
+  const toggleLifecycle = l => (l === "active" ? "archived" : "active");   // 2-state (Q1)
+
+  return { buildView, hiddenSelected, toggleScope, toggleLifecycle };
+})();
+
+// ============================================================================
+//  THROWAWAY PAGE SHELL below — real data, wiring, rendering. Not liftable.
+// ============================================================================
+
+// This project's cwd (what tsm would resolve at launch). Rows here are "this project".
+const PROJECT_CWD = "~/code/projects/traex-session-manager";
+
+// --- REAL sampled rows (read-only from state_5.sqlite, 2026-08-07). titles trimmed for width. ---
+const RAW = [
+  ["019fdce3","wayfinder: T-filter(04)","$wayfinder tsm 接下来干啥","~/code/projects/traex-session-manager","08-07 23:59",616064,"3o",0],
+  ["019fdcd9","","$ask-matt 这个仓库用来搭建 CoreHR 团队的前端 E2E 测试，corehr-fe 仓库在 ~/code/bytedance-projects 下…","~/code/bytedance-projects/corehr-e2e-playground","08-07 23:58",430127,"3o",0],
+  ["019fdced","$wayfinder tsm ticket 07，用中文回复我","$wayfinder tsm ticket 07，用中文回复我","~/code/projects/traex-session-manager","08-07 23:57",262691,"3o",0],
+  ["019fdceb","wayfinder: T-batch(06)","$wayfinder tsm ticket 06，用中文回复我","~/code/projects/traex-session-manager","08-07 23:56",295452,"3o",0],
+  ["019fdcea1","","You are helping plan an E2E test build. Two exploration targets, both read-only. TARGET 1 — The two generator skills…","~/code/bytedance-projects/corehr-e2e-playground","08-07 23:54",1433719,"3o",0],
+  ["019fdcea2","","You are exploring a git repo at corehr-e2e-playground. Content lives on git refs, NOT the working tree…","~/code/bytedance-projects/corehr-e2e-playground","08-07 23:51",429807,"3o",0],
+  ["019fdcb5a","wayfinder: T-proj","$wayfinder T-proj","~/code/projects/traex-session-manager","08-07 23:49",1445476,"3o",0],
+  ["019fdcb5b","wayfinder: T-layout","$wayfinder T-layout","~/code/projects/traex-session-manager","08-07 23:38",1889562,"3o",0],
+  ["019fdcd8","","I'm investigating how the traex CLI captures and stores the working directory (cwd) for a session/thread…","~/code/projects/traex-session-manager","08-07 23:33",454729,"3o",0],
+  ["019fdcc1","","","~/code/bytedance-projects/plasticine-workspace","08-07 23:06",0,null,0],
+  ["019fdb79","$wayfinder 我想做个 traex 的会话管理器 TUI，能够列出当前项目下的所有 traex 会话信息，然后能批量选中后删除会话…","$wayfinder 我想做个 traex 的会话管理器 TUI…","~/code/projects/traex-session-manager","08-07 18:12",4322452,"3o",0],
+  ["019fdba1a","You are resolving a wayfinder RESEARCH ticket for the tsm spec effort (R3 rename write-back safety)…","You are resolving a wayfinder RESEARCH ticket…","~/code/projects/traex-session-manager","08-07 18:10",6736282,"3o",0],
+  ["019fdba1b","You are resolving a wayfinder RESEARCH ticket for the tsm spec effort (R1 sqlite read facts)…","You are resolving a wayfinder RESEARCH ticket…","~/code/projects/traex-session-manager","08-07 18:03",2962511,"3o",0],
+  ["019fdba1c","You are resolving a wayfinder RESEARCH ticket for the tsm spec effort (R2 mutation command facts)…","You are resolving a wayfinder RESEARCH ticket…","~/code/projects/traex-session-manager","08-07 18:02",2500000,"3o",0],
+  ["019fdbd0","分析下这个仓库的架构，AI Coding 的流程是怎样的，尤其关注测试验收环节是如何让 Agent 去做的","分析下这个仓库的架构…","~/code/bytedance-projects/business-material-hub","08-07 11:09",975009,"3o",0],
+  ["019fd7b0","编制趋势需求 - case-001 - slice-001","开发编制趋势需求的 task-case-001-slice-001","~/code/bytedance-projects/corehr-org-development-loop-workspace","08-07 00:09",21780228,"Sol",0],
+  ["019fd328","我想做一个类似只狼的 3d 游戏，像素风格，能还原原作的拼刀打铁快感…","我想做一个类似只狼的 3d 游戏…","~/code/demos/games","08-06 02:43",272223,"Sol",0],
+  ["019fd324","我想把 cli 改造成支持精美的 TUI","我想把 cli 改造成支持精美的 TUI","~/.plasticine-dotfiles","08-06 02:35",2643608,"Sol",0],
+  ["019fabe0","$development-loop:playwright-cli 用 profile 独立启动 chrome，打开 exam.larkoffice.com 分析题目答案并勾选","$development-loop:playwright-cli…","~/code/demos/performance-360","07-29 11:25",728094,"DS-V4",0],
+  ["019f57c5","这个bug的原因是什么？有必现的路径吗？有必现的bifrost接口时序mock吗？只分析，不用改代码","这个bug的原因是什么？…","~/code/demos/development-loop-demo","07-13 10:24",62355016,"GPT-5.5",0],
+  // --- [DEMO-ARCHIVED] synthetic: live DB has 0 archived; these exercise the lifecycle toggle ---
+  ["demo-arch-1","[DEMO-ARCHIVED] old sqlite probe spike","throwaway: probe state_5 schema","~/code/projects/traex-session-manager","08-02 10:12",88123,"3o",1],
+  ["demo-arch-2","[DEMO-ARCHIVED] scratch exec run","say hi from /tmp","~/code/demos/games","07-30 22:41",1204,"3o",1],
+];
+// map to objects; fabricate updated_at_ms from the "MM-DD HH:MM" ordering (monotonic desc as listed).
+const ALL = RAW.map((r, i) => ({
+  id: r[0], title: r[1], fum: r[2], cwd: r[3], updated: r[4],
+  tokens: r[5], model: r[6] || "—", archived: r[7],
+  updated_at_ms: (RAW.length - i) * 1000, // preserve listed order; archived rows sink appropriately by their slot
+}));
+
+// --- app state (mirrors the Rust App filter-relevant fields) ---
+const state = {
+  scope: "project",
+  lifecycle: "active",
+  search: "",
+  mode: "normal",  // "normal" | "search"
+  selected: new Set(),
+  cursor: 0,      // index into current view
+};
+let view = [];    // current filtered+sorted rows
+
+// ---- helpers ----
+const esc = s => (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+function human(n){ if(n>=1e6) return (n/1e6).toFixed(1)+"M"; if(n>=1e3) return Math.round(n/1e3)+"k"; return ""+n; }
+function highlight(text, q){
+  const t = esc(text);
+  if(!q) return t;
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  if(i<0) return t;
+  const a=esc(text.slice(0,i)), b=esc(text.slice(i,i+q.length)), c=esc(text.slice(i+q.length));
+  return a+'<span class="hit">'+b+'</span>'+c;
+}
+function displayTitle(r){
+  const base = r.title && r.title.trim() ? r.title : (r.fum && r.fum.trim() ? r.fum : "(untitled)");
+  return base;
+}
+
+// ---- render ----
+function recompute(){
+  view = FilterModel.buildView(ALL, PROJECT_CWD, state);
+  if(state.cursor >= view.length) state.cursor = Math.max(0, view.length-1);
+}
+function render(){
+  recompute();
+  const isAll = state.scope === "all";
+
+  // state panel
+  document.getElementById("v-scope").textContent = isAll ? "all projects" : "this project";
+  document.getElementById("v-life").textContent  = state.lifecycle;
+  const hidden = FilterModel.hiddenSelected(ALL, view, state.selected);
+  const sp = document.getElementById("statepanel");
+  sp.innerHTML =
+    `<span class="f">mode <b class="${state.mode==="search"?"on":""}">${state.mode}</b></span>`+
+    `<span class="f">scope <b class="on">${isAll?"all":"project"}</b></span>`+
+    `<span class="f">lifecycle <b class="on">${state.lifecycle}</b></span>`+
+    `<span class="f">search <b class="${state.search?"on":""}">${state.search?('"'+esc(state.search)+'"'):"off"}</b></span>`+
+    `<span class="f">sort <b>updated_at_ms DESC</b></span>`+
+    `<span class="f">visible <b>${view.length}</b> / ${ALL.length}</span>`+
+    `<span class="f">selected <b>${state.selected.size}</b>${hidden.length?` (<b>${hidden.length}</b> hidden)`:""}</span>`;
+
+  // mode bar — shows which keys are live right now (answers "how do I act while searching?")
+  const mb = document.getElementById("modebar");
+  if(state.mode === "search"){
+    mb.innerHTML = `<b>SEARCH mode</b> — typing filters live. `+
+      `<span class="kept">Enter</span> commit &amp; keep filter (→ normal, then p/Tab/Space work) · `+
+      `<span class="kept">Esc</span> clear &amp; exit · <span class="kept">↑ ↓</span> move cursor. `+
+      `p / Tab / Space / * are just text here — commit first.`;
+  } else {
+    const kept = state.search ? ` · filter <b>"${esc(state.search)}"</b> still active (<span class="kept">/</span> edit · <span class="kept">Esc</span> clear)` : "";
+    mb.innerHTML = `<b>NORMAL mode</b> — <span class="kept">p</span> scope · <span class="kept">Tab</span> lifecycle · `+
+      `<span class="kept">Space</span> select · <span class="kept">*</span> invert · <span class="kept">/</span> search`+kept;
+  }
+
+  // header columns
+  const hdr = document.getElementById("hdr");
+  const list = document.getElementById("list");
+  if(isAll){
+    hdr.style.gridTemplateColumns = "20px 62px 230px 1fr 46px";
+    hdr.innerHTML = `<span></span><span>updated</span><span>cwd</span><span>session</span><span></span>`;
+  } else {
+    hdr.style.gridTemplateColumns = "20px 88px 1fr 60px 64px";
+    hdr.innerHTML = `<span></span><span>updated</span><span>session</span><span>model</span><span>tokens</span>`;
+  }
+
+  // rows
+  if(view.length === 0){
+    list.innerHTML = `<div class="empty">`+
+      (state.search
+        ? `no sessions match <b>"${esc(state.search)}"</b> in this scope.<br>press <b>clear search</b>, or switch scope to <b>all projects</b>.`
+        : (state.lifecycle==="archived"
+            ? `no <b>archived</b> sessions in this scope.<br>switch lifecycle back to <b>active</b>.`
+            : `no sessions in <b>this project</b>.<br>switch scope to <b>all projects</b> to see everything.`))+
+      `</div>`;
+  } else {
+    list.innerHTML = view.map((r, idx) => {
+      const seld = state.selected.has(r.id);
+      const cur  = idx === state.cursor;
+      const cls = "row"+(cur?" cur":"")+(seld?" sel":"");
+      const box = `<span class="box${seld?' on':''}">${seld?'▣':'▢'}</span>`;
+      const arch = r.archived ? `<span class="c-arch">⌂arch</span>` : ``;
+      if(isAll){
+        const cwd = r.cwd.replace("~/code/","").replace("~/","");
+        return `<div class="${cls}" data-i="${idx}" style="grid-template-columns:20px 62px 230px 1fr 46px">`+
+          box+
+          `<span class="c-upd">${r.updated.slice(6)}</span>`+
+          `<span class="c-cwd">${esc(cwd)}</span>`+
+          `<span class="c-title">${highlight(displayTitle(r), state.search)}</span>`+
+          `<span>${arch}</span>`+
+        `</div>`;
+      } else {
+        return `<div class="${cls}" data-i="${idx}" style="grid-template-columns:20px 88px 1fr 60px 64px">`+
+          box+
+          `<span class="c-upd">${r.updated}</span>`+
+          `<span class="c-title">${highlight(displayTitle(r), state.search)} ${arch}</span>`+
+          `<span class="c-model">${esc(r.model)}</span>`+
+          `<span class="c-tok">${human(r.tokens)}</span>`+
+        `</div>`;
+      }
+    }).join("");
+    [...list.querySelectorAll(".row")].forEach(el=>{
+      el.onclick = () => { state.cursor = +el.dataset.i; toggleCursor(); };
+    });
+  }
+
+  // footer
+  document.getElementById("cnt").innerHTML =
+    `<b>${view.length}</b> shown${state.search?` · <b>${view.length}</b> match`:""} · <b>${state.selected.size}</b> selected`;
+  document.getElementById("keys").innerHTML =
+    `<b>p</b> scope · <b>Tab</b> lifecycle · <b>/</b> search · <b>Space</b> select · <b>*</b> invert`;
+}
+
+// ---- actions (what the real keybinds would dispatch) ----
+function toggleCursor(){
+  const r = view[state.cursor];
+  if(!r) return;
+  if(state.selected.has(r.id)) state.selected.delete(r.id); else state.selected.add(r.id);
+  render();
+}
+function invertVisible(){
+  view.forEach(r => { if(state.selected.has(r.id)) state.selected.delete(r.id); else state.selected.add(r.id); });
+  render();
+}
+document.getElementById("btn-scope").onclick = () => { if(state.mode==="search")return; state.scope = FilterModel.toggleScope(state.scope); render(); };
+document.getElementById("btn-life").onclick  = () => { if(state.mode==="search")return; state.lifecycle = FilterModel.toggleLifecycle(state.lifecycle); render(); };
+document.getElementById("btn-clear").onclick = () => { document.getElementById("search").value=""; state.search=""; state.mode="normal"; document.getElementById("search").blur(); render(); };
+document.getElementById("btn-toggle").onclick= () => { if(state.mode==="search")return; toggleCursor(); };
+document.getElementById("btn-invert").onclick= () => { if(state.mode==="search")return; invertVisible(); };
+document.getElementById("btn-deselect").onclick=() => { state.selected.clear(); render(); };
+
+const searchEl = document.getElementById("search");
+searchEl.addEventListener("focus", () => { state.mode="search"; render(); });
+searchEl.addEventListener("input", e => { state.search = e.target.value; state.cursor=0; render(); });
+searchEl.addEventListener("keydown", e => {
+  if(e.key==="Enter"){ e.preventDefault(); state.mode="normal"; searchEl.blur(); render(); }        // commit & keep
+  else if(e.key==="Escape"){ e.preventDefault(); state.search=""; searchEl.value=""; state.mode="normal"; searchEl.blur(); render(); } // clear & exit
+  else if(e.key==="ArrowDown"){ e.preventDefault(); state.cursor=Math.min(state.cursor+1,view.length-1); render(); }
+  else if(e.key==="ArrowUp"){ e.preventDefault(); state.cursor=Math.max(state.cursor-1,0); render(); }
+});
+
+// ============================================================================
+//  GUIDED WALKTHROUGHS — the awkward cases, hard to reason about on paper.
+// ============================================================================
+const SCENARIOS = [
+  {
+    name: "Default landing",
+    desc: `The moment you launch tsm in this repo. <span class="watch">Watch:</span> only THIS project's active sessions, newest first — not the 20+ across all projects. This is the "just show me what I'm working on" default.`,
+    steps: [
+      ["reset to default", resetDefault],
+    ],
+  },
+  {
+    name: "Find across projects",
+    desc: `You remember a session about "游戏/game" but it's in another project. <span class="watch">Watch:</span> searching in the default scope finds nothing (it's not in THIS project) — you widen to all projects first, THEN the search hits. This is the AND-stack: search respects scope (Q4).`,
+    steps: [
+      ["reset to default", resetDefault],
+      ['search "游戏"  → 0 hits here', ()=>setSearch("游戏")],
+      ["scope → all projects", ()=>{state.scope="all";render();}],
+      ["(now it appears)", ()=>{}],
+    ],
+  },
+  {
+    name: "Search → act flow",
+    desc: `Answers "how do I act while searching?" Search is a MODE. <span class="watch">Watch:</span> while typing, p/Tab/Space are just text. Press <b>Enter</b> to commit — filter stays, mode → normal — and NOW Space/*/Tab work on the filtered set. This is the "search a batch, select all, delete" flow.`,
+    steps: [
+      ["reset to default", resetDefault],
+      ["/ enter search mode", ()=>{searchEl.focus();}],
+      ['type "wayfinder"', ()=>setSearch("wayfinder")],
+      ["Enter → commit & keep (normal)", ()=>{state.mode="normal";searchEl.blur();render();}],
+      ["* invert = select all filtered", ()=>invertVisible()],
+      ["Tab → archived (filter persists)", ()=>{state.lifecycle="archived";render();}],
+      ["Esc → clear filter", ()=>{state.search="";searchEl.value="";state.lifecycle="active";render();}],
+    ],
+  },
+  {
+    name: "Hidden-selection (silent)",
+    desc: `Selection is kept by id and <span class="watch">silently preserved</span> across filtering (decision Q5 — no warning). You multi-select across all projects, then narrow so some vanish. Watch the state panel: "selected N (M hidden)" — the count holds; a batch delete still includes the hidden ones (T-batch's modal enumerates them).`,
+    steps: [
+      ["reset to default", resetDefault],
+      ["scope → all projects", ()=>{state.scope="all";render();}],
+      ["select cursor row", ()=>{state.cursor=0;toggleCursor();}],
+      ["move down + select", ()=>{state.cursor=4;toggleCursor();}],
+      ["move down + select", ()=>{state.cursor=8;toggleCursor();}],
+      ["scope → this project (some hide)", ()=>{state.scope="project";render();}],
+      ["deselect all (reset)", ()=>{state.selected.clear();render();}],
+    ],
+  },
+  {
+    name: "Archived round-trip",
+    desc: `Managing archived sessions (uses 2 synthetic [DEMO-ARCHIVED] rows — live DB has none). <span class="watch">Watch:</span> active view hides them; Tab to archived reveals them; scope still applies on top (archived ∧ this-project vs archived ∧ all).`,
+    steps: [
+      ["reset to default", resetDefault],
+      ["lifecycle → archived", ()=>{state.lifecycle="archived";render();}],
+      ["scope → all projects", ()=>{state.scope="all";render();}],
+      ["scope → this project", ()=>{state.scope="project";render();}],
+      ["lifecycle → active", ()=>{state.lifecycle="active";render();}],
+    ],
+  },
+  {
+    name: "Empty states",
+    desc: `What you see when a filter combination matches nothing. <span class="watch">Watch:</span> the message differs by cause — empty search vs empty archived vs empty project — each nudging you to the fix (clear search / switch lifecycle / widen scope).`,
+    steps: [
+      ["reset to default", resetDefault],
+      ['search "zzzznope" (no match)', ()=>setSearch("zzzznope")],
+      ["clear search + archived (none here)", ()=>{state.search="";document.getElementById("search").value="";state.lifecycle="archived";state.scope="all";render();setTimeout(()=>{state.scope="project";render();},0);}],
+    ],
+  },
+];
+function resetDefault(){ state.scope="project"; state.lifecycle="active"; state.search=""; state.mode="normal"; document.getElementById("search").value=""; document.getElementById("search").blur(); state.selected.clear(); state.cursor=0; render(); }
+function setSearch(q){ state.search=q; state.mode="search"; document.getElementById("search").value=q; state.cursor=0; render(); }
+
+let curScenario = 0, curStep = 0;
+function renderTabs(){
+  const tabs = document.getElementById("tabs");
+  tabs.innerHTML = SCENARIOS.map((s,i)=>`<button data-i="${i}" class="${i===curScenario?'on':''}">${esc(s.name)}</button>`).join("");
+  [...tabs.querySelectorAll("button")].forEach(b=>b.onclick=()=>{curScenario=+b.dataset.i;curStep=0;runStepReset();renderScenario();});
+}
+function runStepReset(){ /* starting a walkthrough resets to known state via its first step when clicked */ }
+function renderScenario(){
+  const s = SCENARIOS[curScenario];
+  document.getElementById("walk-desc").innerHTML = s.desc;
+  const steps = document.getElementById("steps");
+  steps.innerHTML = s.steps.map((st,i)=>{
+    const cls = i<curStep ? "done" : (i===curStep ? "next" : "");
+    return `<button data-i="${i}" class="${cls}">${i+1}. ${esc(st[0])}</button>`;
+  }).join("");
+  [...steps.querySelectorAll("button")].forEach(b=>b.onclick=()=>{
+    const i=+b.dataset.i; s.steps[i][1](); curStep=Math.min(i+1, s.steps.length); renderScenario();
+  });
+}
+
+// keyboard niceties (mirror real keybinds). Search MODE swallows p/Tab/Space/etc into the input;
+// the input's own keydown handles Enter/Esc/arrows above. Here we handle NORMAL mode only.
+document.addEventListener("keydown", e=>{
+  if(state.mode === "search") return;               // input listener owns keys while searching
+  if(e.key==="/"){ e.preventDefault(); searchEl.focus(); }        // enter search mode
+  else if(e.key==="Escape"){ if(state.search){ state.search=""; searchEl.value=""; render(); } } // clear committed filter
+  else if(e.key==="p"){ state.scope=FilterModel.toggleScope(state.scope); render(); }
+  else if(e.key==="Tab"){ e.preventDefault(); state.lifecycle=FilterModel.toggleLifecycle(state.lifecycle); render(); }
+  else if(e.key===" "){ e.preventDefault(); toggleCursor(); }
+  else if(e.key==="*"){ invertVisible(); }
+  else if(e.key==="j"||e.key==="ArrowDown"){ state.cursor=Math.min(state.cursor+1,view.length-1); render(); }
+  else if(e.key==="k"||e.key==="ArrowUp"){ state.cursor=Math.max(state.cursor-1,0); render(); }
+});
+
+// boot
+renderTabs(); renderScenario(); render();
+</script>

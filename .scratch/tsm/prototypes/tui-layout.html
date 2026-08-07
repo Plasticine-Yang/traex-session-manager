@@ -1,0 +1,442 @@
+<!doctype html>
+<!--
+  THROWAWAY PROTOTYPE — answers wayfinder ticket T-layout (.scratch/tsm/issues/05-tui-layout.md).
+  Question: what should the tsm main screen look like? (paradigm, columns, multi-select, status bar)
+  How to run: double-click this file. Nothing to install.
+  Data: REAL rows pulled read-only from ~/.trae/cli/state_5.sqlite on 2026-08-07 (7 sessions in
+        this project, 36 total). Note the deliberately-preserved 8-char id collisions
+        (019fdcb5 ×2, 019fdba1 ×3) and the giant wall-of-text titles — both shape the design.
+  Flip VARIANT (A/B/C/D) with the bottom bar or ← →. Flip SCENE with the top buttons.
+  This is a mock of a ratatui TUI, not the real thing. It lands on a throwaway branch when done.
+-->
+<meta charset="utf-8">
+<title>tsm — T-layout prototype</title>
+<style>
+  :root{
+    --bg:#16161e; --panel:#1a1b26; --fg:#c0caf5; --dim:#565f89;
+    --cyan:#7dcfff; --purple:#bb9af7; --green:#9ece6a; --red:#f7768e; --yellow:#e0af68;
+    --rowcur:#283457; --border:#2a2e42;
+  }
+  html,body{background:var(--bg);color:var(--fg);margin:0;
+    font-family:ui-monospace,"SF Mono",Menlo,"Cascadia Code",Consolas,monospace;}
+  .wrap{max-width:900px;margin:0 auto;padding:20px 16px 120px;}
+  h1{font-size:16px;color:var(--purple);margin:0 0 2px;}
+  .sub{color:var(--dim);font-size:12px;margin:0 0 14px;line-height:1.5;}
+  .sub b{color:var(--cyan);font-weight:600;}
+  .scenes{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;}
+  .scenes button{background:var(--panel);color:var(--fg);border:1px solid var(--border);
+    border-radius:6px;padding:5px 10px;font:inherit;font-size:12px;cursor:pointer;}
+  .scenes button.on{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 0 1px var(--cyan) inset;}
+  .term{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+    padding:14px 16px;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.4);}
+  pre{margin:0;font-size:13px;line-height:1.42;white-space:pre;}
+  .cur{color:var(--cyan);font-weight:700;}
+  .rowcur{background:var(--rowcur);display:inline-block;min-width:100%;border-radius:3px;}
+  .on{color:var(--cyan);font-weight:700;}
+  .off{color:var(--dim);}
+  .key{color:var(--purple);}
+  .titlebar{color:var(--purple);font-weight:600;}
+  .foot{color:var(--dim);}
+  .path{color:var(--cyan);}
+  .warn{color:var(--yellow);}
+  .ok{color:var(--green);}
+  .bad{color:var(--red);}
+  .bar{color:var(--green);}
+  .state{color:var(--dim);font-size:12px;margin-top:12px;line-height:1.6;}
+  .state b{color:var(--fg);}
+  .note{color:var(--yellow);font-size:12px;margin-top:6px;}
+  .switch{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;
+    background:#0e0f16;border:1px solid var(--purple);border-radius:999px;
+    padding:6px 8px;display:flex;align-items:center;gap:4px;box-shadow:0 6px 24px rgba(0,0,0,.5);}
+  .switch button{background:transparent;border:0;color:var(--fg);font:inherit;font-size:14px;
+    cursor:pointer;padding:4px 8px;border-radius:999px;}
+  .switch .v{padding:4px 6px;border-radius:999px;color:var(--dim);}
+  .switch .v.on{background:var(--purple);color:#0e0f16;font-weight:700;}
+  .switch .lbl{color:var(--cyan);font-size:12px;min-width:150px;text-align:center;}
+</style>
+
+<div class="wrap">
+  <h1>tsm — main-screen layout prototype</h1>
+  <p class="sub">
+    Throwaway mock for ticket <b>T-layout</b>. Four structurally different layouts on the same
+    real data. <b>Flip variant</b> with the bottom bar or <b>← →</b>. <b>Flip scene</b> below.<br>
+    Feedback I'm after: which <b>paradigm</b> wins (dense vs master-detail), which <b>columns</b>,
+    and does the <b>multi-select + footer</b> feel right? Steal bits across variants freely.
+  </p>
+
+  <div class="scenes" id="scenes"></div>
+  <div class="term"><pre id="screen"></pre></div>
+  <div class="note" id="note"></div>
+  <div class="state" id="stateline"></div>
+</div>
+
+<div class="switch">
+  <button id="prev">←</button>
+  <span class="v" data-v="A">A</span>
+  <span class="v" data-v="B">B</span>
+  <span class="v" data-v="C">C</span>
+  <span class="v" data-v="D">D</span>
+  <button id="next">→</button>
+  <span class="lbl" id="vlbl"></span>
+</div>
+
+<script>
+// ---- variants: layout paradigm ----
+const VARIANTS = {
+  A: "Dense list · no preview",
+  B: "Master + bottom preview",
+  C: "Master + right preview",
+  D: "Grouped by project",
+};
+// ---- scenes: what state the screen is in ----
+const SCENES = [
+  ["normal",  "Current project"],
+  ["all",     "All projects"],
+  ["search",  "Search"],
+  ["batch",   "Batch-delete confirm"],
+  ["rename",  "Rename (inline)"],
+  ["archived","Archived view"],
+  ["help",    "Help / keymap"],
+];
+// scenes that are layout-independent overlays (rendered once, on a B-ish base)
+const OVERLAY = new Set(["search","batch","rename","archived","help"]);
+
+// ============ FRAMES ============
+// Conventions: full-width top/divider/bottom lines; content lines start "│ " with NO right border
+// (keeps CJK double-width text from raggedy-ing the right edge). ▶=cursor ▣=checked ▢=unchecked.
+
+const F = {}; // F[variant][scene]
+
+// ---------- Variant A : dense single list, footer only ----------
+F.A = {
+normal:
+`┌ tsm ─ traex session manager ───────────────────────── project · active ┐
+│  ✓  updated       session                              model   tokens
+│─────────────────────────────────────────────────────────────────────────
+│▶ ▢  08-07 23:00  wayfinder: T-layout                    3o      442k
+│  ▣  08-07 22:58  wayfinder: T-proj                      3o      299k
+│  ▢  08-07 18:12  $wayfinder 我想做个 traex 的会话管理器 TUI…   3o      4.3M
+│  ▣  08-07 18:10  You are resolving a wayfinder RESEARC…  3o      6.7M
+│  ▢  08-07 18:03  You are resolving a wayfinder RESEARC…  3o      2.9M
+│  ▢  08-07 18:02  You are resolving a wayfinder RESEARC…  3o      2.5M
+│  ▢  08-07 17:06  $setup-matt-pocock-skills 按你默认推荐…    3o      414k
+│
+│
+├─────────────────────────────────────────────────────────────────────────
+│ project·active   2 selected   [Space]sel [d]del [a]arch [r]ren [/]find [?]help
+└─────────────────────────────────────────────────────────────────────────`,
+all:
+`┌ tsm ─ traex session manager ───────────────────────────── all · active ┐
+│  ✓  updated       cwd                       session                model
+│─────────────────────────────────────────────────────────────────────────
+│▶ ▢  23:00  traex-session-manager   wayfinder: T-layout            3o
+│  ▢  22:58  traex-session-manager   wayfinder: T-proj              3o
+│  ▢  18:16  corehr-e2e-playground   按目前已有的 skills，我想把…       3o
+│  ▢  18:12  traex-session-manager   $wayfinder 我想做个 traex…       3o
+│  ▢  16:56  corehr-org-develop…     momo 开发耗时久分析              3o
+│  ▢  11:09  business-material-hub   分析下这个仓库的架构，AI Coding… 3o
+│  ▢  01:08  corehr-e2e-playground   生成飞书文档介绍                 3o
+│
+├─────────────────────────────────────────────────────────────────────────
+│ all·active   0 selected   [p]→project  [Space]sel [d]del [/]find [?]help
+└─────────────────────────────────────────────────────────────────────────`
+};
+
+// ---------- Variant B : master + bottom preview (horizontal split) ----------
+F.B = {
+normal:
+`┌ tsm ─ traex session manager ───────────────────────── project · active ┐
+│  # ✓  updated   session                              model  tok    arch
+│─────────────────────────────────────────────────────────────────────────
+│▶ 1 ▢  23:00    wayfinder: T-layout                    3o    442k
+│  2 ▣  22:58    wayfinder: T-proj                      3o    299k
+│  3 ▢  18:12    $wayfinder 我想做个 traex 的会话管理器 TUI…   3o    4.3M
+│  4 ▣  18:10    You are resolving a wayfinder RESEARCH… 3o    6.7M
+│  5 ▢  18:03    You are resolving a wayfinder RESEARCH… 3o    2.9M
+│  6 ▢  18:02    You are resolving a wayfinder RESEARCH… 3o    2.5M
+│  7 ▢  17:06    $setup-matt-pocock-skills 按你默认推荐…    3o    414k
+├─ preview ────────────────────────────────────────────────────────────────
+│ wayfinder: T-layout
+│ id  019fdcb5-…-b9f2   ·  main  ·  openrouter-3o  ·  442,875 tok  ·  active
+│ cwd ~/code/projects/traex-session-manager
+│ ›   $wayfinder T-layout
+└ 2 selected ─ [Space]sel [d]del [a]arch [r]ren [/]find [p]all [?]help ─────`,
+all:
+`┌ tsm ─ traex session manager ───────────────────────────── all · active ┐
+│  # ✓  updated   cwd                     session                    model
+│─────────────────────────────────────────────────────────────────────────
+│▶ 1 ▢  23:00    traex-session-manager  wayfinder: T-layout          3o
+│  2 ▢  22:58    traex-session-manager  wayfinder: T-proj            3o
+│  3 ▢  18:16    corehr-e2e-playground  按目前已有的 skills，我想把…     3o
+│  4 ▢  18:12    traex-session-manager  $wayfinder 我想做个 traex…     3o
+│  5 ▢  16:56    corehr-org-develop…    momo 开发耗时久分析            3o
+│  6 ▢  11:09    business-material-hub  分析下这个仓库的架构…          3o
+│  7 ▢  01:08    corehr-e2e-playground  生成飞书文档介绍               3o
+├─ preview ────────────────────────────────────────────────────────────────
+│ wayfinder: T-layout
+│ id  019fdcb5-…-b9f2   ·  main  ·  openrouter-3o  ·  442,875 tok  ·  active
+│ cwd ~/code/projects/traex-session-manager
+│ ›   $wayfinder T-layout
+└ 0 selected ─ [p]→project [Space]sel [d]del [a]arch [r]ren [/]find [?] ────`
+};
+
+// ---------- Variant C : master + right preview (vertical split) ----------
+F.C = {
+normal:
+`┌ tsm ─ traex session manager ─────────────────────── project · active ┐
+│ ✓  upd    session                    │ wayfinder: T-layout
+│───────────────────────────────────── │ ─────────────────────────────
+│▶▢ 23:00  wayfinder: T-layout         │ id   019fdcb5-…-b9f2
+│ ▣ 22:58  wayfinder: T-proj           │ br   main
+│ ▢ 18:12  $wayfinder 我想做个 traex… │ md   openrouter-3o
+│ ▣ 18:10  You are resolving a way…    │ tok  442,875
+│ ▢ 18:03  You are resolving a way…    │ arch active
+│ ▢ 18:02  You are resolving a way…    │ cwd  ~/code/projects/
+│ ▢ 17:06  $setup-matt-pocock-skil…   │      traex-session-manager
+│                                      │
+│                                      │ first message ›
+│                                      │ $wayfinder T-layout
+├───────────────────────────────────────────────────────────────────────
+│ project·active  2 selected  [Space]sel [d]del [a]arch [r]ren [/]find [?]
+└───────────────────────────────────────────────────────────────────────`,
+all:
+`┌ tsm ─ traex session manager ───────────────────────── all · active ┐
+│ ✓  upd    cwd            session      │ wayfinder: T-layout
+│───────────────────────────────────── │ ─────────────────────────────
+│▶▢ 23:00  traex-sess…  T-layout       │ id   019fdcb5-…-b9f2
+│ ▢ 22:58  traex-sess…  T-proj         │ br   main
+│ ▢ 18:16  corehr-e2e…  按目前已有的…  │ md   openrouter-3o
+│ ▢ 18:12  traex-sess…  $wayfinder…    │ tok  442,875
+│ ▢ 16:56  corehr-org…  momo 开发耗时… │ arch active
+│ ▢ 11:09  business-m…  分析下这个…    │ cwd  ~/code/projects/
+│ ▢ 01:08  corehr-e2e…  生成飞书文档…  │      traex-session-manager
+│                                      │
+├───────────────────────────────────────────────────────────────────────
+│ all·active  0 selected  [p]→project [Space]sel [d]del [/]find [?]help
+└───────────────────────────────────────────────────────────────────────`
+};
+
+// ---------- Variant D : grouped by project (single column, section headers) ----------
+F.D = {
+normal:
+`┌ tsm ─ traex session manager ───────────────────────── project · active ┐
+│  ✓  updated     session                                   model  tokens
+│─────────────────────────────────────────────────────────────────────────
+│ ~/code/projects/traex-session-manager                            (7)
+│▶▢  23:00       wayfinder: T-layout                          3o    442k
+│ ▣  22:58       wayfinder: T-proj                            3o    299k
+│ ▢  18:12       $wayfinder 我想做个 traex 的会话管理器 TUI…      3o    4.3M
+│ ▣  18:10       You are resolving a wayfinder RESEARCH tic…   3o    6.7M
+│ ▢  18:03       You are resolving a wayfinder RESEARCH tic…   3o    2.9M
+│ ▢  18:02       You are resolving a wayfinder RESEARCH tic…   3o    2.5M
+│ ▢  17:06       $setup-matt-pocock-skills 按你默认推荐的 se…     3o    414k
+├─────────────────────────────────────────────────────────────────────────
+│ project·active (1 group)  2 selected  [Space]sel [d]del [r]ren [/]find [?]
+└─────────────────────────────────────────────────────────────────────────`,
+all:
+`┌ tsm ─ traex session manager ───────────────────────────── all · active ┐
+│  ✓  updated     session                                   model  tokens
+│─────────────────────────────────────────────────────────────────────────
+│ ~/code/projects/traex-session-manager                            (4)
+│▶▢  23:00       wayfinder: T-layout                          3o    442k
+│ ▣  22:58       wayfinder: T-proj                            3o    299k
+│ ▢  18:12       $wayfinder 我想做个 traex 的会话管理器 TUI…      3o    4.3M
+│ ▢  17:06       $setup-matt-pocock-skills 按你默认推荐的 se…     3o    414k
+│ ~/code/bytedance-projects/corehr-e2e-playground                  (2)
+│ ▢  18:16       按目前已有的 skills，我想把 [Image] https:/…      3o    …
+│ ▢  01:08       生成飞书文档介绍                              3o    …
+│ ~/code/bytedance-projects/corehr-org-development-loop-workspace  (1)
+│ ▢  16:56       momo 开发耗时久分析                           3o    …
+├─────────────────────────────────────────────────────────────────────────
+│ all·active (3 groups)  1 selected  [Space]sel [d]del [/]find [p]proj [?]
+└─────────────────────────────────────────────────────────────────────────`
+};
+
+// ---------- Overlay scenes (layout-independent; shown on the B base) ----------
+const OV = {
+search:
+`┌ tsm ─ traex session manager ───────────────────────── project · active ┐
+│ /research▏                                              3/7 matches
+│─────────────────────────────────────────────────────────────────────────
+│▶ ▢  18:10    You are resolving a wayfinder RESEARCH tic… 3o    6.7M
+│  ▢  18:03    You are resolving a wayfinder RESEARCH tic… 3o    2.9M
+│  ▢  18:02    You are resolving a wayfinder RESEARCH tic… 3o    2.5M
+│
+│  substring match over title + first_user_message, case-insensitive.
+│  Esc clears the filter · Enter keeps it and returns to the list.
+├─ preview ────────────────────────────────────────────────────────────────
+│ You are resolving a wayfinder RESEARCH ticket for the tsm spec effort…
+│ id  019fdba1-…-…    ·  main  ·  openrouter-3o  ·  6,736,282 tok
+│ cwd ~/code/projects/traex-session-manager
+└ searching ─ [Enter]keep [Esc]clear ──────────────────────────────────────`,
+batch:
+`┌ tsm ─ traex session manager ───────────────────────── project · active ┐
+│  # ✓  updated   session                              model  tok
+│─────────────────────────────────────────────────────────────────────────
+│  1 ▢  23:00    wayfinder: T-layout                    3o    442k
+│▓▓2 ▣▓▓22:58▓▓▓▓wayfinder: T-proj▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓3o▓▓▓▓299k
+│      ┌ Delete 2 sessions? ───────────────────────────────┐
+│      │ runs:  traex delete <id> --force   (×2)            │
+│      │                                                    │
+│      │  • wayfinder: T-proj                               │
+│      │  • You are resolving a wayfinder RESEARCH ticket…  │
+│      │                                                    │
+│      │ Irreversible — also removes rollout .jsonl files.  │
+│      │                                                    │
+│      │        [D] delete        [Esc] cancel              │
+│      └────────────────────────────────────────────────────┘
+├───────────────────────────────────────────────────────────────────────────
+│ confirm required — capital [D] (not Enter) to avoid a fat-finger delete
+└───────────────────────────────────────────────────────────────────────────`,
+rename:
+`┌ tsm ─ traex session manager ───────────────────────── project · active ┐
+│  # ✓  updated   session                              model  tok
+│─────────────────────────────────────────────────────────────────────────
+│▶ 1 ▢  23:00   [ wayfinder: T-layout▏                    ]   ✎
+│  2 ▣  22:58    wayfinder: T-proj                      3o    299k
+│  3 ▢  18:12    $wayfinder 我想做个 traex 的会话管理器 TUI…   3o    4.3M
+│  4 ▣  18:10    You are resolving a wayfinder RESEARCH… 3o    6.7M
+│
+│  inline edit, prefilled with current title. Writes threads.title directly
+│  (traex has no rename CLI — see R3). Newlines stripped; empty title rejected.
+├─ preview ────────────────────────────────────────────────────────────────
+│ editing row 1 …
+│ [Enter] save   [Esc] cancel
+└ rename ─ [Enter]save [Esc]cancel ────────────────────────────────────────`,
+archived:
+`┌ tsm ─ traex session manager ────────────────────── project · archived ┐
+│  # ✓  updated   session                              model  archived_at
+│─────────────────────────────────────────────────────────────────────────
+│▶ 1 ▢  08-02    old spike: sqlite probe                 3o    08-05 10:12
+│  2 ▢  07-30    throwaway exec run                      3o    08-04 22:41
+│
+│  lifecycle = archived (threads.archived = 1). [a] here UNarchives.
+│  archive/unarchive physically move rollout files — gated by state (R2).
+├─ preview ────────────────────────────────────────────────────────────────
+│ old spike: sqlite probe
+│ id  019fda00-…-…    ·  main  ·  openrouter-3o  ·  archived
+│ cwd ~/code/projects/traex-session-manager
+└ project·archived ─ [Tab]cycle lifecycle  [a]unarchive  [d]del ───────────`,
+help:
+`┌ tsm ─ keymap ───────────────────────────────────────────────────────────┐
+│
+│  move        j / ↓   k / ↑        g / G  top / bottom
+│  select      Space   toggle       *      invert all (visible)
+│  delete      d       cursor row, or all selected → confirm modal ([D])
+│  archive     a       archive (active) / unarchive (archived), state-gated
+│  rename      r       inline edit → threads.title  (Enter save · Esc cancel)
+│  search      /       substring over title+first_user_message · Esc clears
+│  scope       p       current project  ↔  all projects (+cwd column)
+│  lifecycle   Tab     active → archived → all
+│  preview     Enter   toggle detail panel (layouts B / C)
+│  refresh     R       re-query the store (also auto after mutations)
+│  help/quit   ?       this screen        q / Ctrl-c  quit
+│
+├───────────────────────────────────────────────────────────────────────────
+│ draft keymap — consolidates T-filter / T-batch / T-rename. Confirm in T-layout.
+└───────────────────────────────────────────────────────────────────────────`
+};
+
+// ============ RENDER / COLORIZE ============
+const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+function colorLine(line, i){
+  let h = esc(line);
+  // title bar (first line) & keymap title
+  if(i===0){ return `<span class="titlebar">${h}</span>`; }
+  // glyphs
+  h = h.replace(/▶/g,'<span class="cur">▶</span>');
+  h = h.replace(/▣/g,'<span class="on">▣</span>');
+  h = h.replace(/▢/g,'<span class="off">▢</span>');
+  h = h.replace(/✎/g,'<span class="cur">✎</span>');
+  h = h.replace(/▏/g,'<span class="cur">▏</span>');
+  h = h.replace(/✓/g,'<span class="ok">✓</span>');   // note: header "✓" column too — fine, greenish
+  h = h.replace(/✗/g,'<span class="bad">✗</span>');
+  h = h.replace(/▓+/g,m=>`<span class="rowcur">${m.replace(/▓/g,' ')}</span>`); // selected highlight band
+  h = h.replace(/█+/g,m=>`<span class="bar">${m}</span>`);
+  // bracketed keys
+  h = h.replace(/\[[^\]]+\]/g,m=>`<span class="key">${m}</span>`);
+  // project path / cwd lines
+  h = h.replace(/(~\/[^\s│]+)/g,'<span class="path">$1</span>');
+  // footer / bottom line
+  if(/^└/.test(line)){ h = `<span class="foot">${h}</span>`; }
+  // divider footer line "│ project·active ..." — dim it a touch by leaving default
+  return h;
+}
+
+function frameFor(variant, scene){
+  if(OVERLAY.has(scene)) return OV[scene];
+  return (F[variant] && F[variant][scene]) || F.B[scene] || F.B.normal;
+}
+
+let curV = "B", curS = "normal";
+
+function render(){
+  const raw = frameFor(curV, curS);
+  const lines = raw.split("\n");
+  document.getElementById("screen").innerHTML =
+    lines.map((l,i)=>colorLine(l,i)).join("\n");
+
+  // variant bar
+  document.querySelectorAll(".v").forEach(el=>{
+    el.classList.toggle("on", el.dataset.v===curV && !OVERLAY.has(curS));
+  });
+  document.getElementById("vlbl").textContent =
+    OVERLAY.has(curS) ? "(overlay — layout-independent)" : `${curV} — ${VARIANTS[curV]}`;
+
+  // scene buttons
+  document.querySelectorAll("#scenes button").forEach(b=>{
+    b.classList.toggle("on", b.dataset.s===curS);
+  });
+
+  // note for overlays
+  const note = document.getElementById("note");
+  note.textContent = OVERLAY.has(curS)
+    ? "↑ overlay/modal state — drawn on the B base but applies to whichever layout wins."
+    : "";
+
+  // surface the full app state (prototype rule: show what changed)
+  const scope = curS==="all" ? "all projects" : "current project";
+  const life  = curS==="archived" ? "archived" : "active";
+  const st = {
+    variant:`${curV} (${VARIANTS[curV]})`, scene:curS,
+    scope, lifecycle:life,
+    search: curS==="search" ? '"research" → 3/7' : "off",
+    selected: (curS==="normal"||curS==="rename") ? 2 : (curS==="all"&&curV==="D"?1:0),
+    sort:"updated_at_ms DESC",
+  };
+  document.getElementById("stateline").innerHTML =
+    `<b>state</b> · variant=<b>${st.variant}</b> · scope=<b>${st.scope}</b> · `+
+    `lifecycle=<b>${st.lifecycle}</b> · search=<b>${st.search}</b> · `+
+    `selected=<b>${st.selected}</b> · sort=${st.sort}`;
+}
+
+// scene buttons
+const sc = document.getElementById("scenes");
+SCENES.forEach(([id,label])=>{
+  const b=document.createElement("button");
+  b.textContent=label; b.dataset.s=id;
+  b.onclick=()=>{curS=id; render();};
+  sc.appendChild(b);
+});
+
+// variant switching
+const order=["A","B","C","D"];
+function cycle(d){
+  if(OVERLAY.has(curS)) curS="normal";       // leaving an overlay picks a real layout
+  let i=(order.indexOf(curV)+d+order.length)%order.length;
+  curV=order[i]; render();
+}
+document.getElementById("prev").onclick=()=>cycle(-1);
+document.getElementById("next").onclick=()=>cycle(1);
+document.querySelectorAll(".v").forEach(el=>{
+  el.style.cursor="pointer";
+  el.onclick=()=>{ if(OVERLAY.has(curS)) curS="normal"; curV=el.dataset.v; render(); };
+});
+document.addEventListener("keydown",e=>{
+  if(e.key==="ArrowLeft") cycle(-1);
+  else if(e.key==="ArrowRight") cycle(1);
+});
+
+render();
+</script>
