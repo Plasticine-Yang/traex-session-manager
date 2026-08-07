@@ -1,0 +1,17 @@
+[package]
+name = "traex-session-manager"
+version = "0.1.0"
+edition = "2024"
+description = "tsm — a terminal UI to list, search, delete, archive, and rename traex CLI sessions"
+license = "MIT"
+
+[[bin]]
+name = "tsm"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+unicode-width = "0.2"
+anyhow = "1"
