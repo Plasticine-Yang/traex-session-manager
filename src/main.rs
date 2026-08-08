@@ -39,11 +39,11 @@ fn run() -> Result<()> {
     match parse_command(std::env::args().skip(1))? {
         Command::Version => {
             println!("tsm {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            Ok(())
         }
         Command::SelfUpdate { check_only } => {
             update::self_update(check_only)?;
-            return Ok(());
+            Ok(())
         }
         Command::Tui { store_path } => run_app(store_path),
     }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "tsm — a terminal UI to list, search, delete, archive, and rename traex CLI sessions"
 license = "MIT"
+repository = "https://github.com/Plasticine-Yang/traex-session-manager"
 
 [[bin]]
 name = "tsm"

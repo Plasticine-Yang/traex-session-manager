@@ -245,7 +245,10 @@ mod tests {
 
     #[test]
     fn session_collapses_newlines() {
-        assert_eq!(session_display("line one\nline two", ""), "line one line two");
+        assert_eq!(
+            session_display("line one\nline two", ""),
+            "line one line two"
+        );
         assert_eq!(session_display("a\t\tb", ""), "a b");
     }
 

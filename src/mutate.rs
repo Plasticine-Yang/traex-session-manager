@@ -363,7 +363,10 @@ mod tests {
             extract_error(b"", Some(2)),
             "Error: traex exited with status 2"
         );
-        assert_eq!(extract_error(b"   ", None), "Error: traex terminated by signal");
+        assert_eq!(
+            extract_error(b"   ", None),
+            "Error: traex terminated by signal"
+        );
     }
 
     #[cfg(unix)]
@@ -371,8 +374,7 @@ mod tests {
     fn path_probe_requires_an_executable_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root =
-            std::env::temp_dir().join(format!("tsm-traex-probe-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tsm-traex-probe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("traex");
