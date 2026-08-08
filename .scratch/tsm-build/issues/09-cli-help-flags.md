@@ -4,11 +4,13 @@
 
 **Blocked by:** none
 
-**Status:** in-progress
+**Status:** done (15ef34c)
 
-- [ ] `tsm -h` 输出帮助并以状态码 0 退出，不打开 Store 或进入 TUI。
-- [ ] `tsm --help` 与 `-h` 输出相同帮助。
-- [ ] 帮助列出当前支持的命令和参数。
-- [ ] README 的 Usage 说明 `-h` / `--help`。
+- [x] `tsm -h` 输出帮助并以状态码 0 退出，不打开 Store 或进入 TUI。
+- [x] `tsm --help` 与 `-h` 输出相同帮助。
+- [x] 帮助列出当前支持的命令和参数。
+- [x] README 的 Usage 说明 `-h` / `--help`。
 
 ## Comments
+
+- 2026-08-08: 实现提交 `15ef34c`;验证 `cargo test`(104 通过)、`cargo fmt --check`、`git diff --check`,并真实运行 `cargo run --quiet -- -h` 与 `cargo run --quiet -- --help`,确认输出一致且成功退出。
