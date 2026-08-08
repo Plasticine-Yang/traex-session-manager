@@ -55,5 +55,5 @@ tsm
 traex-session-manager
 ```
 
-Use `--db <path>` to override traex Store discovery and `--version` to print
-the installed version.
+Use `-h` or `--help` to see all commands and options. `--db <path>` overrides
+traex Store discovery, and `--version` prints the installed version.

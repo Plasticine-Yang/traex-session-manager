@@ -26,6 +26,25 @@ use app::App;
 use app::Mode;
 use store::Store;
 
+const HELP: &str = "\
+tsm — manage traex CLI sessions
+
+Usage:
+  tsm [--db <path>]
+  tsm self-update [--check]
+  tsm --version
+  tsm --help
+
+Options:
+  --db <path>  Use a specific traex Store
+  -V, --version
+               Print the installed version
+  -h, --help   Print this help
+
+Commands:
+  self-update          Install the latest release
+  self-update --check  Check whether an update is available";
+
 fn main() {
     if let Err(err) = run() {
         // Startup-phase fatal errors: clear stderr message, non-zero exit, no TUI
@@ -37,6 +56,10 @@ fn main() {
 
 fn run() -> Result<()> {
     match parse_command(std::env::args().skip(1))? {
+        Command::Help => {
+            println!("{HELP}");
+            Ok(())
+        }
         Command::Version => {
             println!("tsm {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -71,6 +94,7 @@ fn run_app(store_flag: Option<PathBuf>) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Tui { store_path: Option<PathBuf> },
+    Help,
     Version,
     SelfUpdate { check_only: bool },
 }
@@ -81,6 +105,10 @@ fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Command> {
     };
 
     match first.as_str() {
+        "--help" | "-h" => {
+            ensure_no_more_args(args, "--help")?;
+            Ok(Command::Help)
+        }
         "--version" | "-V" => {
             ensure_no_more_args(args, "--version")?;
             Ok(Command::Version)
@@ -335,6 +363,16 @@ mod tests {
             parse_command(["--version".to_string()].into_iter()).unwrap(),
             Command::Version
         );
+    }
+
+    #[test]
+    fn parses_both_help_flags_without_opening_the_store() {
+        for flag in ["-h", "--help"] {
+            assert_eq!(
+                parse_command([flag.to_string()].into_iter()).unwrap(),
+                Command::Help
+            );
+        }
     }
 
     #[test]
