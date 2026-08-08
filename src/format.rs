@@ -145,6 +145,65 @@ pub fn truncate_display(s: &str, max_width: usize) -> String {
     out
 }
 
+/// Truncate `s` to `max_width` display columns keeping **both ends** legible,
+/// with `…` in the middle (spec §5.1/§5.2 — for `cwd` and the preview `id`).
+/// Never splits a wide (CJK) character.
+pub fn truncate_middle(s: &str, max_width: usize) -> String {
+    if s.width() <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    // One column for the ellipsis; split the rest between head and tail,
+    // giving the head the extra column on odd budgets.
+    let budget = max_width - 1;
+    let tail_budget = budget / 2;
+    let head_budget = budget - tail_budget;
+
+    let mut head = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > head_budget {
+            break;
+        }
+        head.push(ch);
+        used += w;
+    }
+
+    // Walk from the end for the tail.
+    let mut tail_rev = String::new();
+    let mut used = 0usize;
+    for ch in s.chars().rev() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > tail_budget {
+            break;
+        }
+        tail_rev.push(ch);
+        used += w;
+    }
+    let tail: String = tail_rev.chars().rev().collect();
+
+    format!("{head}…{tail}")
+}
+
+/// Render an absolute `cwd` relative to `home`, collapsing the home prefix to
+/// `~` (spec §5.2). Paths outside `home` are returned unchanged.
+pub fn cwd_relative_home(cwd: &str, home: &str) -> String {
+    if home.is_empty() {
+        return cwd.to_string();
+    }
+    if cwd == home {
+        return "~".to_string();
+    }
+    let with_sep = format!("{home}/");
+    if let Some(rest) = cwd.strip_prefix(&with_sep) {
+        return format!("~/{rest}");
+    }
+    cwd.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +266,38 @@ mod tests {
         assert_eq!(truncate_display("你好世界", 5), "你好…");
         // Never split a wide char: budget 4 => ellipsis(1) + 3 cols fits 1 char.
         assert_eq!(truncate_display("你好世界", 4), "你…");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_both_ends() {
+        assert_eq!(truncate_middle("short", 10), "short");
+        // "abcdefghij" width 10 into 7 => budget 6, head 3 tail 3.
+        assert_eq!(truncate_middle("abcdefghij", 7), "abc…hij");
+        // Odd budget gives head the extra column.
+        assert_eq!(truncate_middle("abcdefghij", 6), "abc…ij");
+    }
+
+    #[test]
+    fn truncate_middle_respects_cjk_width() {
+        // Wide chars (2 cols each). max 7 => budget 6, head 3/tail 3: 1 wide char
+        // fits each side (2 cols), never split.
+        assert_eq!(truncate_middle("你好世界龙", 7), "你…龙");
+    }
+
+    #[test]
+    fn truncate_middle_tiny_widths() {
+        assert_eq!(truncate_middle("abcdef", 1), "…");
+        assert_eq!(truncate_middle("abcdef", 0), "…");
+    }
+
+    #[test]
+    fn cwd_relative_home_cases() {
+        assert_eq!(cwd_relative_home("/home/u", "/home/u"), "~");
+        assert_eq!(cwd_relative_home("/home/u/proj/x", "/home/u"), "~/proj/x");
+        assert_eq!(cwd_relative_home("/other/place", "/home/u"), "/other/place");
+        // Prefix must be path-segment aligned, not a bare string prefix.
+        assert_eq!(cwd_relative_home("/home/user2", "/home/u"), "/home/user2");
+        assert_eq!(cwd_relative_home("/home/u", ""), "/home/u");
     }
 
     #[test]

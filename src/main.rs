@@ -48,7 +48,7 @@ fn run() -> Result<()> {
     // (spec §11); the store maps SQLITE_BUSY to the busy message.
     let rows = store.query_project_active(&cwd)?;
 
-    let mut app = App::new(cwd, rows);
+    let mut app = App::new(store, cwd, rows);
     run_tui(&mut app)?;
     Ok(())
 }
@@ -124,6 +124,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('k') | KeyCode::Up => app.cursor_up(),
         KeyCode::Char('g') => app.cursor_first(),
         KeyCode::Char('G') => app.cursor_last(),
+        KeyCode::Char('p') => app.toggle_scope(),
+        KeyCode::Tab => app.toggle_lifecycle(),
+        KeyCode::Enter => app.toggle_preview(),
         _ => {}
     }
 }

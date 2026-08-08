@@ -9,6 +9,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
 
+/// The `threads` projection shared by every list query (spec §2.3/§2.5); the
+/// only per-query difference is the trailing `WHERE` / `ORDER BY`.
+const SELECT_SESSION: &str = "SELECT id,title,first_user_message,cwd,updated_at,updated_at_ms,\
+     archived,archived_at,git_branch,model,tokens_used \
+     FROM threads";
+
 /// Columns tsm relies on in `threads`; presence is validated before we trust a
 /// database (spec §2.2 / §2.3).
 const REQUIRED_COLUMNS: &[&str] = &[
@@ -151,17 +157,44 @@ impl Store {
     /// runs one query, drops it. A `SQLITE_BUSY` timeout is mapped to the
     /// spec §11 busy message; other failures propagate as-is.
     pub fn query_project_active(&self, cwd: &str) -> Result<Vec<Session>> {
-        self.query_project_active_inner(cwd).map_err(map_busy)
+        self.query(Some(cwd), false)
     }
 
-    fn query_project_active_inner(&self, cwd: &str) -> rusqlite::Result<Vec<Session>> {
+    /// Run one scope×lifecycle query (spec §2.5). `scope_cwd = Some(cwd)` filters
+    /// to the current project (Scope=Project); `None` spans all projects
+    /// (Scope=All). `archived` selects the Lifecycle band (`false`=Active,
+    /// `true`=Archived). Rows come back sorted `updated_at_ms DESC`.
+    ///
+    /// Each call is its own short read (spec §2.4): fresh connection, one query,
+    /// drop. A `SQLITE_BUSY` timeout maps to the spec §11 busy message.
+    pub fn query(&self, scope_cwd: Option<&str>, archived: bool) -> Result<Vec<Session>> {
+        self.query_inner(scope_cwd, archived).map_err(map_busy)
+    }
+
+    fn query_inner(
+        &self,
+        scope_cwd: Option<&str>,
+        archived: bool,
+    ) -> rusqlite::Result<Vec<Session>> {
         let conn = open_readonly_raw(&self.db_path)?;
-        let mut stmt = conn.prepare(
-            "SELECT id,title,first_user_message,cwd,updated_at,updated_at_ms,\
-                    archived,archived_at,git_branch,model,tokens_used \
-             FROM threads WHERE cwd = ?1 AND archived = 0 ORDER BY updated_at_ms DESC",
-        )?;
-        stmt.query_map([cwd], row_to_session)?
+        let archived_flag = i64::from(archived);
+        // The `cwd` predicate is the only shape difference across the four
+        // combos (spec §2.5); the archived flag is always bound.
+        let (sql, params) = match scope_cwd {
+            Some(cwd) => (
+                format!("{SELECT_SESSION} WHERE cwd = ?1 AND archived = ?2 ORDER BY updated_at_ms DESC"),
+                vec![
+                    rusqlite::types::Value::Text(cwd.to_string()),
+                    rusqlite::types::Value::Integer(archived_flag),
+                ],
+            ),
+            None => (
+                format!("{SELECT_SESSION} WHERE archived = ?1 ORDER BY updated_at_ms DESC"),
+                vec![rusqlite::types::Value::Integer(archived_flag)],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(params), row_to_session)?
             .collect::<rusqlite::Result<Vec<_>>>()
     }
 }
@@ -316,11 +349,12 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch(
-            "INSERT INTO threads (id,title,first_user_message,cwd,updated_at,updated_at_ms,archived,tokens_used)
-             VALUES ('a','Older','fu','/proj',100,100000,0,10),
-                    ('b','Newer','fu','/proj',200,200000,0,20),
-                    ('c','Archived','fu','/proj',300,300000,1,30),
-                    ('d','Other','fu','/elsewhere',400,400000,0,40)",
+            "INSERT INTO threads (id,title,first_user_message,cwd,updated_at,updated_at_ms,archived,archived_at,tokens_used)
+             VALUES ('a','Older','fu','/proj',100,100000,0,NULL,10),
+                    ('b','Newer','fu','/proj',200,200000,0,NULL,20),
+                    ('c','Archived','fu','/proj',300,300000,1,3050,30),
+                    ('d','Other','fu','/elsewhere',400,400000,0,NULL,40),
+                    ('e','OtherArch','fu','/elsewhere',500,500000,1,5050,50)",
         )
         .unwrap();
     }
@@ -338,6 +372,31 @@ mod tests {
         let ids: Vec<_> = rows.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
         assert_eq!(rows[0].tokens_used, 20);
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    fn ids_of(rows: &[Session]) -> Vec<&str> {
+        rows.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn query_covers_all_four_scope_lifecycle_combos() {
+        let tmp = std::env::temp_dir().join(format!("tsm-combos-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        seed_db(&tmp);
+        let store = Store::open(tmp.clone()).unwrap();
+
+        // Project · Active
+        assert_eq!(ids_of(&store.query(Some("/proj"), false).unwrap()), vec!["b", "a"]);
+        // Project · Archived
+        let arch = store.query(Some("/proj"), true).unwrap();
+        assert_eq!(ids_of(&arch), vec!["c"]);
+        assert_eq!(arch[0].archived_at, Some(3050));
+        // All · Active (newest first, both projects)
+        assert_eq!(ids_of(&store.query(None, false).unwrap()), vec!["d", "b", "a"]);
+        // All · Archived
+        assert_eq!(ids_of(&store.query(None, true).unwrap()), vec!["e", "c"]);
 
         std::fs::remove_file(&tmp).unwrap();
     }
