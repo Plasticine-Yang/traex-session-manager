@@ -25,6 +25,7 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "title",
     "first_user_message",
     "cwd",
+    "source",
     "updated_at",
     "updated_at_ms",
     "archived",
@@ -191,7 +192,8 @@ impl Store {
         let (sql, params) = match scope_cwd {
             Some(cwd) => (
                 format!(
-                    "{SELECT_SESSION} WHERE cwd = ?1 AND archived = ?2 ORDER BY updated_at_ms DESC"
+                    "{SELECT_SESSION} WHERE cwd = ?1 AND archived = ?2 \
+                     AND source IN ('cli', 'vscode') ORDER BY updated_at_ms DESC"
                 ),
                 vec![
                     rusqlite::types::Value::Text(cwd.to_string()),
@@ -199,7 +201,10 @@ impl Store {
                 ],
             ),
             None => (
-                format!("{SELECT_SESSION} WHERE archived = ?1 ORDER BY updated_at_ms DESC"),
+                format!(
+                    "{SELECT_SESSION} WHERE archived = ?1 \
+                     AND source IN ('cli', 'vscode') ORDER BY updated_at_ms DESC"
+                ),
                 vec![rusqlite::types::Value::Integer(archived_flag)],
             ),
         };
@@ -355,6 +360,7 @@ mod tests {
                 title TEXT NOT NULL DEFAULT '',
                 first_user_message TEXT NOT NULL DEFAULT '',
                 cwd TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'cli',
                 updated_at INTEGER NOT NULL,
                 updated_at_ms INTEGER,
                 archived INTEGER NOT NULL DEFAULT 0,
@@ -374,6 +380,42 @@ mod tests {
                     ('e','OtherArch','fu','/elsewhere',500,500000,1,5050,50)",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn query_excludes_subagent_sessions_like_traex_resume() {
+        let tmp = std::env::temp_dir().join(format!("tsm-subagents-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        seed_db(&tmp);
+        let conn = Connection::open(&tmp).unwrap();
+        conn.execute(
+            "INSERT INTO threads (
+                id,title,first_user_message,cwd,source,updated_at,updated_at_ms,archived,tokens_used
+             ) VALUES (
+                'subagent','Review the diff','fu','/proj',
+                '{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\",\"depth\":1}}}',
+                300,300000,0,30
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (
+                id,title,first_user_message,cwd,source,updated_at,updated_at_ms,archived,tokens_used
+             ) VALUES (
+                'vscode','Interactive IDE session','fu','/proj','vscode',250,250000,0,25
+             )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(tmp.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+
+        assert_eq!(ids_of(&rows), vec!["vscode", "b", "a"]);
+
+        std::fs::remove_file(&tmp).unwrap();
     }
 
     #[test]

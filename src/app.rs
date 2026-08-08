@@ -955,6 +955,7 @@ mod tests {
                 title TEXT NOT NULL DEFAULT '',
                 first_user_message TEXT NOT NULL DEFAULT '',
                 cwd TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'cli',
                 updated_at INTEGER NOT NULL,
                 updated_at_ms INTEGER,
                 archived INTEGER NOT NULL DEFAULT 0,
