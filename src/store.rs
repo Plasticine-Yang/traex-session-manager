@@ -154,6 +154,11 @@ impl Store {
         Ok(Self { db_path })
     }
 
+    /// Path used by the independent rename write connection (spec §2.6).
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     /// Run the current-project active-sessions query (spec §2.5, the default landing).
     ///
     /// Each refresh is its own short read (spec §2.4): opens a fresh connection,
@@ -185,7 +190,9 @@ impl Store {
         // combos (spec §2.5); the archived flag is always bound.
         let (sql, params) = match scope_cwd {
             Some(cwd) => (
-                format!("{SELECT_SESSION} WHERE cwd = ?1 AND archived = ?2 ORDER BY updated_at_ms DESC"),
+                format!(
+                    "{SELECT_SESSION} WHERE cwd = ?1 AND archived = ?2 ORDER BY updated_at_ms DESC"
+                ),
                 vec![
                     rusqlite::types::Value::Text(cwd.to_string()),
                     rusqlite::types::Value::Integer(archived_flag),
@@ -221,8 +228,7 @@ pub fn is_busy_error(err: &anyhow::Error) -> bool {
 /// Open a read-only connection with the exact flags/pragmas from spec §2.4,
 /// adding path context on failure.
 fn open_readonly(db_path: &Path) -> Result<Connection> {
-    open_readonly_raw(db_path)
-        .with_context(|| format!("failed to open {}", db_path.display()))
+    open_readonly_raw(db_path).with_context(|| format!("failed to open {}", db_path.display()))
 }
 
 /// [`open_readonly`] without the anyhow context wrapping, so callers can inspect
@@ -317,7 +323,10 @@ mod tests {
             "state_5.sqlite-wal".to_string(),
             "notes.txt".to_string(),
         ];
-        assert_eq!(pick_state_db(&names), Some((10, "state_10.sqlite".to_string())));
+        assert_eq!(
+            pick_state_db(&names),
+            Some((10, "state_10.sqlite".to_string()))
+        );
     }
 
     #[test]
@@ -396,13 +405,19 @@ mod tests {
         let store = Store::open(tmp.clone()).unwrap();
 
         // Project · Active
-        assert_eq!(ids_of(&store.query(Some("/proj"), false).unwrap()), vec!["b", "a"]);
+        assert_eq!(
+            ids_of(&store.query(Some("/proj"), false).unwrap()),
+            vec!["b", "a"]
+        );
         // Project · Archived
         let arch = store.query(Some("/proj"), true).unwrap();
         assert_eq!(ids_of(&arch), vec!["c"]);
         assert_eq!(arch[0].archived_at, Some(3050));
         // All · Active (newest first, both projects)
-        assert_eq!(ids_of(&store.query(None, false).unwrap()), vec!["d", "b", "a"]);
+        assert_eq!(
+            ids_of(&store.query(None, false).unwrap()),
+            vec!["d", "b", "a"]
+        );
         // All · Archived
         assert_eq!(ids_of(&store.query(None, true).unwrap()), vec!["e", "c"]);
 
@@ -419,7 +434,10 @@ mod tests {
         drop(conn);
 
         let err = Store::open(tmp.clone()).unwrap_err();
-        assert!(err.to_string().contains("unrecognized traex database schema"));
+        assert!(
+            err.to_string()
+                .contains("unrecognized traex database schema")
+        );
         std::fs::remove_file(&tmp).unwrap();
     }
 }

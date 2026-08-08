@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use ratatui::widgets::TableState;
 
 use crate::mutate::{self, BatchHandle, BatchJob, Op, Runner};
+use crate::rename::{self, RenameError, RenameOutcome, RenameRunner};
 use crate::store::{Session, Store};
 
 /// Project range of the list (spec §4.3, CONTEXT "Scope"). Two-state toggle.
@@ -45,6 +46,13 @@ pub enum Mode {
     Normal,
     /// Live incremental filtering; printable keys edit the search term.
     Search,
+    /// Inline single-row title editor. `cursor` is a character index, never a
+    /// byte offset, so left/right/delete remain safe for CJK input (spec §7.1).
+    Rename {
+        id: String,
+        buf: String,
+        cursor: usize,
+    },
     /// Delete-confirmation modal (spec §6.3): lists the titles about to be
     /// deleted; uppercase `D` confirms, `Esc`/`n` cancels. Single-delete (no
     /// selection, just the cursor row) rides the same modal with one item.
@@ -168,6 +176,9 @@ pub struct App {
     /// How each op actually runs (spec §6.4). Production spawns `traex`; tests
     /// inject a deterministic runner.
     runner: Runner,
+    /// Independent SQLite write path for the one direct mutation tsm owns
+    /// (`threads.title`, spec §2.6/§7).
+    rename_runner: RenameRunner,
     /// Set once `q` / `Ctrl-c` is pressed.
     pub should_quit: bool,
 }
@@ -197,7 +208,25 @@ impl App {
         initial_rows: Vec<Session>,
         runner: Runner,
     ) -> Self {
-        Self::with_runner_and_availability(store, cwd, initial_rows, runner, true)
+        let rename_runner = rename::runner(store.db_path().to_path_buf());
+        Self::with_runners_and_availability(store, cwd, initial_rows, runner, rename_runner, true)
+    }
+
+    #[cfg(test)]
+    fn with_rename_runner(
+        store: Store,
+        cwd: String,
+        initial_rows: Vec<Session>,
+        rename_runner: RenameRunner,
+    ) -> Self {
+        Self::with_runners_and_availability(
+            store,
+            cwd,
+            initial_rows,
+            std::sync::Arc::new(|_, _| None),
+            rename_runner,
+            true,
+        )
     }
 
     /// Build an app with explicit mutation execution and PATH-probe state.
@@ -206,6 +235,25 @@ impl App {
         cwd: String,
         initial_rows: Vec<Session>,
         runner: Runner,
+        traex_available: bool,
+    ) -> Self {
+        let rename_runner = rename::runner(store.db_path().to_path_buf());
+        Self::with_runners_and_availability(
+            store,
+            cwd,
+            initial_rows,
+            runner,
+            rename_runner,
+            traex_available,
+        )
+    }
+
+    fn with_runners_and_availability(
+        store: Store,
+        cwd: String,
+        initial_rows: Vec<Session>,
+        runner: Runner,
+        rename_runner: RenameRunner,
         traex_available: bool,
     ) -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -227,6 +275,7 @@ impl App {
             batch: None,
             progress: BatchProgress::default(),
             runner,
+            rename_runner,
             should_quit: false,
         };
         app.rebuild_view();
@@ -262,6 +311,21 @@ impl App {
     pub fn selected_session(&self) -> Option<&Session> {
         let i = self.table.selected()?;
         self.view.get(i).map(|&idx| &self.all_rows[idx])
+    }
+
+    pub fn rename_display(&self, session_id: &str) -> Option<String> {
+        let Mode::Rename { id, buf, cursor } = &self.mode else {
+            return None;
+        };
+        if id != session_id {
+            return None;
+        }
+        let byte = char_to_byte(buf, *cursor);
+        let mut display = String::with_capacity(buf.len() + "▏".len());
+        display.push_str(&buf[..byte]);
+        display.push('▏');
+        display.push_str(&buf[byte..]);
+        Some(display)
     }
 
     /// Toggle Scope (Project ↔ All) and re-query (spec §4.3 / §2.5).
@@ -331,6 +395,135 @@ impl App {
         self.rebuild_view();
     }
 
+    // --- Rename (spec §7) ----------------------------------------------------
+
+    pub fn start_rename(&mut self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let id = session.id.clone();
+        let buf = session.title.clone();
+        let cursor = buf.chars().count();
+        self.message = None;
+        self.mode = Mode::Rename { id, buf, cursor };
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.mode = Mode::Normal;
+        self.message = None;
+    }
+
+    pub fn rename_insert(&mut self, character: char) {
+        let Mode::Rename { buf, cursor, .. } = &mut self.mode else {
+            return;
+        };
+        let byte = char_to_byte(buf, *cursor);
+        buf.insert(byte, character);
+        *cursor += 1;
+    }
+
+    pub fn rename_left(&mut self) {
+        if let Mode::Rename { cursor, .. } = &mut self.mode {
+            *cursor = cursor.saturating_sub(1);
+        }
+    }
+
+    pub fn rename_right(&mut self) {
+        if let Mode::Rename { buf, cursor, .. } = &mut self.mode {
+            *cursor = (*cursor + 1).min(buf.chars().count());
+        }
+    }
+
+    pub fn rename_home(&mut self) {
+        if let Mode::Rename { cursor, .. } = &mut self.mode {
+            *cursor = 0;
+        }
+    }
+
+    pub fn rename_end(&mut self) {
+        if let Mode::Rename { buf, cursor, .. } = &mut self.mode {
+            *cursor = buf.chars().count();
+        }
+    }
+
+    pub fn rename_backspace(&mut self) {
+        let Mode::Rename { buf, cursor, .. } = &mut self.mode else {
+            return;
+        };
+        if *cursor == 0 {
+            return;
+        }
+        let start = char_to_byte(buf, *cursor - 1);
+        let end = char_to_byte(buf, *cursor);
+        buf.replace_range(start..end, "");
+        *cursor -= 1;
+    }
+
+    pub fn rename_delete(&mut self) {
+        let Mode::Rename { buf, cursor, .. } = &mut self.mode else {
+            return;
+        };
+        if *cursor >= buf.chars().count() {
+            return;
+        }
+        let start = char_to_byte(buf, *cursor);
+        let end = char_to_byte(buf, *cursor + 1);
+        buf.replace_range(start..end, "");
+    }
+
+    pub fn submit_rename(&mut self) {
+        let (id, buf) = match &self.mode {
+            Mode::Rename { id, buf, .. } => (id.clone(), buf.clone()),
+            _ => return,
+        };
+        let Some(title) = rename::normalize_title(&buf) else {
+            self.message = Some("标题不能为空".to_string());
+            return;
+        };
+
+        match (self.rename_runner)(&id, &title) {
+            Ok(RenameOutcome::Renamed) => {
+                self.mode = Mode::Normal;
+                if self.restore_after_rename(Some(&id)) {
+                    self.message = Some("已重命名".to_string());
+                }
+            }
+            Ok(RenameOutcome::Missing) => {
+                self.mode = Mode::Normal;
+                if self.restore_after_rename(None) {
+                    self.message = Some("会话已不存在,可能已在别处删除".to_string());
+                }
+            }
+            Err(RenameError::Busy) => {
+                self.message = Some("库忙,请重试".to_string());
+            }
+            Err(RenameError::Other(error)) => {
+                self.message = Some(format!("重命名失败: {error}"));
+            }
+        }
+    }
+
+    fn restore_after_rename(&mut self, anchor: Option<&str>) -> bool {
+        let scope_cwd = match self.scope {
+            Scope::Project => Some(self.cwd.as_str()),
+            Scope::All => None,
+        };
+        let archived = matches!(self.lifecycle, Lifecycle::Archived);
+        match self.store.query(scope_cwd, archived) {
+            Ok(rows) => {
+                self.all_rows = rows;
+                self.rebuild_view();
+                self.prune_selection();
+                self.restore_cursor(anchor);
+                true
+            }
+            Err(error) => {
+                self.message = Some(runtime_query_message(&error));
+                false
+            }
+        }
+    }
+
     // --- Multi-selection (spec §4.5 / §5.3) --------------------------------
 
     /// Toggle selection of the cursor row (`Space`), keyed by session id so the
@@ -344,8 +537,7 @@ impl App {
     /// Invert selection over the currently visible (filtered) set (`*`, spec
     /// §5.3). Hidden-but-selected rows are untouched (spec §4.5).
     pub fn invert_visible_selection(&mut self) {
-        let visible_ids: Vec<String> =
-            self.visible_sessions().map(|s| s.id.clone()).collect();
+        let visible_ids: Vec<String> = self.visible_sessions().map(|s| s.id.clone()).collect();
         for id in visible_ids {
             self.toggle_id(id);
         }
@@ -732,11 +924,17 @@ fn runtime_query_message(err: &anyhow::Error) -> String {
     }
 }
 
+fn char_to_byte(text: &str, character_index: usize) -> usize {
+    text.char_indices()
+        .nth(character_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
 /// Case-insensitive substring match of `needle` against a session's `title` +
 /// `first_user_message` (spec §4.3). `needle` must already be lowercased.
 fn session_matches(s: &Session, needle: &str) -> bool {
-    s.title.to_lowercase().contains(needle)
-        || s.first_user_message.to_lowercase().contains(needle)
+    s.title.to_lowercase().contains(needle) || s.first_user_message.to_lowercase().contains(needle)
 }
 
 #[cfg(test)]
@@ -799,6 +997,18 @@ mod tests {
         let store = Store::open(path.clone()).unwrap();
         let rows = store.query_project_active("/proj").unwrap();
         App::new(store, "/proj".to_string(), rows)
+    }
+
+    fn app_with_rename_runner(n: usize, rename_runner: RenameRunner) -> (App, std::path::PathBuf) {
+        let path = unique_db();
+        let _ = std::fs::remove_file(&path);
+        seed(&path, n);
+        let store = Store::open(path.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        (
+            App::with_rename_runner(store, "/proj".to_string(), rows, rename_runner),
+            path,
+        )
     }
 
     /// Like [`app_with`], but injects a batch runner that actually mutates the
@@ -1000,7 +1210,10 @@ mod tests {
             app.search_push(c);
         }
         assert_eq!(app.view.len(), 1);
-        assert_eq!(app.visible_sessions().next().unwrap().id, app.all_rows[0].id);
+        assert_eq!(
+            app.visible_sessions().next().unwrap().id,
+            app.all_rows[0].id
+        );
     }
 
     #[test]
@@ -1180,6 +1393,167 @@ mod tests {
         assert_eq!(
             runtime_query_message(&anyhow::anyhow!("disk I/O error")),
             "disk I/O error"
+        );
+    }
+
+    // --- Rename (ticket 04) --------------------------------------------------
+
+    #[test]
+    fn rename_starts_from_raw_title_and_ignores_multi_selection() {
+        let mut app = app_with(3);
+        app.invert_visible_selection();
+        let cursor_id = app.selected_session().unwrap().id.clone();
+        let original = app.selected_session().unwrap().title.clone();
+
+        app.start_rename();
+
+        match &app.mode {
+            Mode::Rename { id, buf, cursor } => {
+                assert_eq!(id, &cursor_id);
+                assert_eq!(buf, &original);
+                assert_eq!(*cursor, original.chars().count());
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+        assert_eq!(app.selected_count(), 3);
+    }
+
+    #[test]
+    fn rename_editor_handles_unicode_navigation_and_deletion() {
+        let mut app = app_with(1);
+        app.start_rename();
+        app.rename_home();
+        while matches!(&app.mode, Mode::Rename { buf, .. } if !buf.is_empty()) {
+            app.rename_delete();
+        }
+        app.rename_insert('你');
+        app.rename_insert('好');
+        app.rename_left();
+        app.rename_delete();
+        app.rename_insert('界');
+        app.rename_end();
+        app.rename_backspace();
+
+        match &app.mode {
+            Mode::Rename { buf, cursor, .. } => {
+                assert_eq!(buf, "你");
+                assert_eq!(*cursor, 1);
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_rename_is_rejected_without_leaving_edit_mode() {
+        let mut app = app_with(1);
+        let old_title = app.selected_session().unwrap().title.clone();
+        app.start_rename();
+        app.rename_home();
+        while matches!(&app.mode, Mode::Rename { buf, .. } if !buf.is_empty()) {
+            app.rename_delete();
+        }
+        app.rename_insert('\t');
+        app.submit_rename();
+
+        assert!(matches!(app.mode, Mode::Rename { .. }));
+        assert_eq!(app.message.as_deref(), Some("标题不能为空"));
+        assert_eq!(app.selected_session().unwrap().title, old_title);
+    }
+
+    #[test]
+    fn successful_rename_refreshes_and_restores_cursor_by_id() {
+        let mut app = app_with(3);
+        app.cursor_down();
+        let id = app.selected_session().unwrap().id.clone();
+        app.start_rename();
+        app.rename_home();
+        while matches!(&app.mode, Mode::Rename { buf, .. } if !buf.is_empty()) {
+            app.rename_delete();
+        }
+        for character in "  新标题\t第二段\n第三段  ".chars() {
+            app.rename_insert(character);
+        }
+        app.submit_rename();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.selected_session().unwrap().id, id);
+        assert_eq!(
+            app.selected_session().unwrap().title,
+            "新标题 第二段 第三段"
+        );
+        assert_eq!(app.message.as_deref(), Some("已重命名"));
+    }
+
+    #[test]
+    fn cancelled_rename_discards_buffer() {
+        let mut app = app_with(1);
+        let original = app.selected_session().unwrap().title.clone();
+        app.start_rename();
+        app.rename_insert('x');
+        app.cancel_rename();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.selected_session().unwrap().title, original);
+    }
+
+    #[test]
+    fn missing_rename_target_refreshes_away_and_exits_editor() {
+        let deleted_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let path_slot = std::sync::Arc::clone(&deleted_path);
+        let runner: RenameRunner = std::sync::Arc::new(move |_id, _title| {
+            let path = path_slot.lock().unwrap().clone().unwrap();
+            Connection::open(path)
+                .unwrap()
+                .execute("DELETE FROM threads WHERE id = 'p0'", [])
+                .unwrap();
+            Ok(RenameOutcome::Missing)
+        });
+        let (mut app, path) = app_with_rename_runner(1, runner);
+        *deleted_path.lock().unwrap() = Some(path);
+        app.start_rename();
+        app.submit_rename();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.all_rows.is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("会话已不存在,可能已在别处删除")
+        );
+    }
+
+    #[test]
+    fn busy_rename_keeps_buffer_cursor_and_editor_for_retry() {
+        let runner: RenameRunner = std::sync::Arc::new(|_, _| Err(RenameError::Busy));
+        let (mut app, _path) = app_with_rename_runner(1, runner);
+        app.start_rename();
+        app.rename_insert('x');
+        let before = app.mode.clone();
+        app.submit_rename();
+
+        assert_eq!(app.mode, before);
+        assert_eq!(app.message.as_deref(), Some("库忙,请重试"));
+    }
+
+    #[test]
+    fn refresh_failure_after_write_is_not_hidden_by_success_toast() {
+        let removed_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let path_slot = std::sync::Arc::clone(&removed_path);
+        let runner: RenameRunner = std::sync::Arc::new(move |_id, _title| {
+            let path = path_slot.lock().unwrap().clone().unwrap();
+            std::fs::remove_file(path).unwrap();
+            Ok(RenameOutcome::Renamed)
+        });
+        let (mut app, path) = app_with_rename_runner(1, runner);
+        *removed_path.lock().unwrap() = Some(path);
+        app.start_rename();
+        app.submit_rename();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_ne!(app.message.as_deref(), Some("已重命名"));
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty())
         );
     }
 
@@ -1468,7 +1842,11 @@ mod tests {
         gate.store(true, Ordering::Release);
         drive(&mut app);
 
-        assert!(matches!(app.mode, Mode::Result { .. }), "mode = {:?}", app.mode);
+        assert!(
+            matches!(app.mode, Mode::Result { .. }),
+            "mode = {:?}",
+            app.mode
+        );
         assert!(app.progress.cancelled);
         let unfired = app.progress.cancelled_ids();
         assert!(!unfired.is_empty(), "expected an unfired tail after cancel");

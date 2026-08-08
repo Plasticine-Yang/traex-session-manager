@@ -56,18 +56,15 @@ fn preview_visible(app: &App, width: u16) -> bool {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // Paint the background.
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme::BG)),
-        area,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
     let show_preview = preview_visible(app, area.width);
     let constraints = if show_preview {
         vec![
-            Constraint::Length(1),                // title bar
-            Constraint::Min(1),                   // table
-            Constraint::Length(PREVIEW_HEIGHT),   // preview
-            Constraint::Length(1),                // footer
+            Constraint::Length(1),              // title bar
+            Constraint::Min(1),                 // table
+            Constraint::Length(PREVIEW_HEIGHT), // preview
+            Constraint::Length(1),              // footer
         ]
     } else {
         vec![
@@ -142,7 +139,10 @@ fn draw_confirm_delete(f: &mut Frame, area: Rect, app: &App, ids: &[String]) {
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("[D]", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[D]",
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" confirm   ", Style::default().fg(theme::DIM)),
         Span::styled("[Esc/n]", Style::default().fg(theme::PURPLE)),
         Span::styled(" cancel", Style::default().fg(theme::DIM)),
@@ -177,11 +177,20 @@ fn draw_running(f: &mut Frame, area: Rect, app: &App, op: crate::mutate::Op) {
         .label(head);
 
     let counts = Line::from(vec![
-        Span::styled(format!("✓ {}", p.succeeded.len()), Style::default().fg(theme::GREEN)),
+        Span::styled(
+            format!("✓ {}", p.succeeded.len()),
+            Style::default().fg(theme::GREEN),
+        ),
         Span::raw("   "),
-        Span::styled(format!("✗ {}", p.failed.len()), Style::default().fg(theme::RED)),
+        Span::styled(
+            format!("✗ {}", p.failed.len()),
+            Style::default().fg(theme::RED),
+        ),
         Span::raw("   "),
-        Span::styled(format!("⟳ {}", p.in_flight()), Style::default().fg(theme::YELLOW)),
+        Span::styled(
+            format!("⟳ {}", p.in_flight()),
+            Style::default().fg(theme::YELLOW),
+        ),
     ]);
 
     // Small accumulating failure list at the bottom (spec §6.5), most recent last.
@@ -242,12 +251,20 @@ fn draw_result(f: &mut Frame, area: Rect, app: &App, op: crate::mutate::Op) {
         let short_id: String = id.chars().take(8).collect();
         lines.push(Line::from(vec![
             Span::styled(format!("  {short_id}  "), Style::default().fg(theme::DIM)),
-            Span::styled("cancelled — not attempted", Style::default().fg(theme::YELLOW)),
+            Span::styled(
+                "cancelled — not attempted",
+                Style::default().fg(theme::YELLOW),
+            ),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("[d]", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[d]",
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" retry   ", Style::default().fg(theme::DIM)),
         Span::styled("[Esc]", Style::default().fg(theme::PURPLE)),
         Span::styled(" close", Style::default().fg(theme::DIM)),
@@ -442,15 +459,19 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some((label, _)) = trailing {
         header_cells.push(Cell::from(label));
     }
-    let header = Row::new(header_cells)
-        .style(Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
+    let header =
+        Row::new(header_cells).style(Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
 
     let home = app.home.clone();
     let rows: Vec<Row> = app
         .visible_sessions()
         .map(|s| {
-            let session =
-                truncate_display(&session_display(&s.title, &s.first_user_message), session_w);
+            let session = match app.rename_display(&s.id) {
+                Some(buffer) => truncate_display(&buffer, session_w),
+                None => {
+                    truncate_display(&session_display(&s.title, &s.first_user_message), session_w)
+                }
+            };
             let model = truncate_display(s.model.as_deref().unwrap_or(""), W_MODEL as usize);
 
             // Checkbox: ▣ selected (cyan) / ▢ unselected (dim), spec §5.3.
@@ -486,10 +507,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     // Width constraints, matching the header/cell order above.
-    let mut widths = vec![
-        Constraint::Length(W_CHECK),
-        Constraint::Length(W_UPDATED),
-    ];
+    let mut widths = vec![Constraint::Length(W_CHECK), Constraint::Length(W_UPDATED)];
     if all_view {
         widths.push(Constraint::Length(W_CWD));
     }
@@ -561,7 +579,10 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
     if !s.first_user_message.trim().is_empty() {
         lines.push(Line::from(vec![
             label("first"),
-            val(truncate_display(&session_display("", &s.first_user_message), id_w)),
+            val(truncate_display(
+                &session_display("", &s.first_user_message),
+                id_w,
+            )),
         ]));
     }
 
@@ -617,6 +638,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     };
     let hint = if app.mode == Mode::Search {
         "  ·  [type] filter  [Enter] keep  [Esc] clear".to_string()
+    } else if matches!(app.mode, Mode::Rename { .. }) {
+        "  ·  [Enter] save [Esc] cancel".to_string()
     } else {
         // `a` reads as archive in the Active view, unarchive in the Archived
         // view (spec §5.7 lifecycle gating); label it from the op itself so the
@@ -629,7 +652,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             "  ·  [j/k] move  [Space] select  [d] delete  [a] {archive_verb}  [/] search  [R] refresh  [?] help  [q] quit"
         )
     };
-    let line = Line::from(vec![left, Span::styled(hint, Style::default().fg(theme::DIM))]);
+    let line = Line::from(vec![
+        left,
+        Span::styled(hint, Style::default().fg(theme::DIM)),
+    ]);
     f.render_widget(line.style(Style::default().bg(theme::BG)), area);
 }
 
@@ -676,13 +702,7 @@ mod tests {
         let store = Store::open(path).unwrap();
         let rows = store.query_project_active("/proj").unwrap();
         let runner: Runner = Arc::new(|_, _| None);
-        App::with_runner_and_availability(
-            store,
-            "/proj".to_string(),
-            rows,
-            runner,
-            traex_available,
-        )
+        App::with_runner_and_availability(store, "/proj".to_string(), rows, runner, traex_available)
     }
 
     fn render_text(app: &mut App) -> String {
@@ -726,9 +746,33 @@ mod tests {
     fn missing_traex_notice_is_visible_without_blocking_render() {
         let mut app = app(false);
         let text = render_text(&mut app);
-        assert!(text.contains(
-            "traex not found · delete/archive/unarchive unavailable"
-        ));
+        assert!(text.contains("traex not found · delete/archive/unarchive unavailable"));
         assert!(text.contains("one"));
+    }
+
+    #[test]
+    fn rename_renders_inline_buffer_and_save_cancel_footer() {
+        let mut app = app(true);
+        app.start_rename();
+        app.rename_insert('新');
+        assert_eq!(app.rename_display("one").as_deref(), Some("one新▏"));
+        let text = render_text(&mut app);
+
+        assert!(text.contains("one新"));
+        assert!(text.contains("▏"));
+        assert!(text.contains("[Enter] save [Esc] cancel"));
+    }
+
+    #[test]
+    fn empty_raw_title_starts_as_an_empty_inline_buffer() {
+        let mut app = app(true);
+        app.show_preview = false;
+        app.all_rows[0].title.clear();
+        app.all_rows[0].first_user_message = "fallback should be hidden".to_string();
+        app.start_rename();
+        let text = render_text(&mut app);
+
+        assert!(text.contains("▏"));
+        assert!(!text.contains("fallback should be hidden"));
     }
 }

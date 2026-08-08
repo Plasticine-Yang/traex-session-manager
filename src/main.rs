@@ -61,9 +61,7 @@ fn parse_db_flag(mut args: impl Iterator<Item = String>) -> Result<Option<PathBu
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => {
-                let path = args
-                    .next()
-                    .context("--db requires a path argument")?;
+                let path = args.next().context("--db requires a path argument")?;
                 db = Some(PathBuf::from(path));
             }
             other if other.starts_with("--db=") => {
@@ -133,6 +131,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
         Mode::Normal => handle_key_normal(app, key),
         Mode::Search => handle_key_search(app, key),
+        Mode::Rename { .. } => handle_key_rename(app, key),
         Mode::ConfirmDelete { .. } => handle_key_confirm(app, key),
         Mode::Running { .. } => handle_key_running(app, key),
         Mode::Result { .. } => handle_key_result(app, key),
@@ -156,6 +155,7 @@ fn handle_key_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('*') => app.invert_visible_selection(),
         KeyCode::Char('d') => app.request_delete(),
         KeyCode::Char('a') => app.request_archive(),
+        KeyCode::Char('r') => app.start_rename(),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('R') => app.refresh(),
         KeyCode::Char('?') => app.show_help(),
@@ -178,6 +178,24 @@ fn handle_key_search(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.search_clear(),
         KeyCode::Backspace => app.search_backspace(),
         KeyCode::Char(c) => app.search_push(c),
+        _ => {}
+    }
+}
+
+/// Rename-mode keys: single-line character editing and save/cancel (spec §7.1).
+fn handle_key_rename(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        KeyCode::Enter => app.submit_rename(),
+        KeyCode::Esc => app.cancel_rename(),
+        KeyCode::Left => app.rename_left(),
+        KeyCode::Right => app.rename_right(),
+        KeyCode::Home => app.rename_home(),
+        KeyCode::End => app.rename_end(),
+        KeyCode::Backspace => app.rename_backspace(),
+        KeyCode::Delete => app.rename_delete(),
+        KeyCode::Char(character) => app.rename_insert(character),
         _ => {}
     }
 }
@@ -277,6 +295,24 @@ mod tests {
     fn help_esc_also_dismisses() {
         let mut app = app();
         app.show_help();
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn rename_keymap_enters_edits_and_cancels() {
+        let mut app = app();
+        handle_key(&mut app, key(KeyCode::Char('r')));
+        assert!(matches!(app.mode, Mode::Rename { .. }));
+
+        handle_key(&mut app, key(KeyCode::Home));
+        handle_key(&mut app, key(KeyCode::Char('新')));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::End));
+        handle_key(&mut app, key(KeyCode::Backspace));
+        handle_key(&mut app, key(KeyCode::Delete));
+        assert!(matches!(app.mode, Mode::Rename { .. }));
+
         handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
     }

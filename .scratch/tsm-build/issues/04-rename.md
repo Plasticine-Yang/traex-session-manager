@@ -6,7 +6,7 @@
 
 **Blocked by:** 01 (独立于 02/03,可与之并行)
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 - [ ] `r` 在光标行原地弹单行行内输入框(非弹窗),底部提示 `[Enter] save [Esc] cancel`;预填原始 `title` 原文、光标末尾;支持 ←/→、Home/End、Backspace/Delete。
 - [ ] `title` 为空的会话:输入框预填**空**(所见即 store 真实 title,不填兜底文案)。
