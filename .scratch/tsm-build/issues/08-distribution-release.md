@@ -8,7 +8,7 @@
 
 **Blocked by:** 01 (需可构建 crate;独立于 02–07,可并行)
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 - [ ] `install.sh`(仓库根):探测 OS/arch 选 target → 从 `releases/latest/download/<asset>` 下载 → 按 `SHA256SUMS` **校验 SHA256** → 解包落 `~/.local/bin/tsm` → 建软链 `~/.local/bin/traex-session-manager -> tsm` → 检测 `~/.local/bin` 不在 PATH 时提示(不擅改 profile)。
 - [ ] **双名触发**:装后 `tsm` 与 `traex-session-manager` 都能启动(后者是软链)。

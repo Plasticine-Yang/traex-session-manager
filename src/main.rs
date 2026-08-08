@@ -7,6 +7,7 @@ mod mutate;
 mod rename;
 mod store;
 mod ui;
+mod update;
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -35,9 +36,22 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let db_flag = parse_db_flag(std::env::args().skip(1))?;
-    let db_path = store::locate_db(db_flag.as_deref())?;
-    let store = Store::open(db_path)?;
+    match parse_command(std::env::args().skip(1))? {
+        Command::Version => {
+            println!("tsm {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Command::SelfUpdate { check_only } => {
+            update::self_update(check_only)?;
+            return Ok(());
+        }
+        Command::Tui { store_path } => run_app(store_path),
+    }
+}
+
+fn run_app(store_flag: Option<PathBuf>) -> Result<()> {
+    let store_path = store::locate_db(store_flag.as_deref())?;
+    let store = Store::open(store_path)?;
 
     // Launch anchor = process CWD, byte-exact match key (spec §8).
     let cwd = std::env::current_dir()
@@ -54,23 +68,59 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Parse the single supported flag, `--db <path>` (spec §9.3). Unknown flags
-/// are surfaced rather than silently ignored.
-fn parse_db_flag(mut args: impl Iterator<Item = String>) -> Result<Option<PathBuf>> {
-    let mut db = None;
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Tui { store_path: Option<PathBuf> },
+    Version,
+    SelfUpdate { check_only: bool },
+}
+
+fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let Some(first) = args.next() else {
+        return Ok(Command::Tui { store_path: None });
+    };
+
+    match first.as_str() {
+        "--version" | "-V" => {
+            ensure_no_more_args(args, "--version")?;
+            Ok(Command::Version)
+        }
+        "self-update" => {
+            let check_only = match args.next().as_deref() {
+                None => false,
+                Some("--check") => true,
+                Some(other) => anyhow::bail!("unknown self-update argument: {other}"),
+            };
+            ensure_no_more_args(args, "self-update")?;
+            Ok(Command::SelfUpdate { check_only })
+        }
+        _ => parse_tui_args(std::iter::once(first).chain(args)),
+    }
+}
+
+fn ensure_no_more_args(mut args: impl Iterator<Item = String>, command: &str) -> Result<()> {
+    if let Some(argument) = args.next() {
+        anyhow::bail!("unexpected argument for {command}: {argument}");
+    }
+    Ok(())
+}
+
+/// Parse the TUI's single supported flag, `--db <path>` (spec §9.3).
+fn parse_tui_args(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut store_path = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => {
                 let path = args.next().context("--db requires a path argument")?;
-                db = Some(PathBuf::from(path));
+                store_path = Some(PathBuf::from(path));
             }
             other if other.starts_with("--db=") => {
-                db = Some(PathBuf::from(&other["--db=".len()..]));
+                store_path = Some(PathBuf::from(&other["--db=".len()..]));
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
-    Ok(db)
+    Ok(Command::Tui { store_path })
 }
 
 /// Set up the terminal, run the event loop, and always restore on exit.
@@ -276,6 +326,29 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn parses_version_without_opening_the_store() {
+        assert_eq!(
+            parse_command(["--version".to_string()].into_iter()).unwrap(),
+            Command::Version
+        );
+    }
+
+    #[test]
+    fn parses_self_update_check_without_opening_the_store() {
+        assert_eq!(
+            parse_command(["self-update".to_string(), "--check".to_string()].into_iter()).unwrap(),
+            Command::SelfUpdate { check_only: true }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_self_update_arguments() {
+        let error = parse_command(["self-update".to_string(), "--force".to_string()].into_iter())
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unknown self-update argument: --force");
     }
 
     #[test]
