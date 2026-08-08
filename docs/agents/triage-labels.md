@@ -24,4 +24,4 @@ This repo's tracker is **local markdown** (see `issue-tracker.md`), which has no
 | ------ | ------------------------------------------------------------------------------------------------------ |
 | `done` | Implementation is complete, verified, and committed. All acceptance `- [ ]` boxes are checked `- [x]`. |
 
-`done` is what the frontier rule keys on: a ticket becomes workable once every ticket in its "Blocked by" list is `done`. `/implement` writes this on close-out (see `implement/SKILL.md`).
+`done` is what the frontier rule keys on: a ticket becomes workable once every ticket in its "Blocked by" list is `done`. It is written on ticket close-out — see the "Closing out a ticket after `/implement`" section in `AGENTS.md`.
