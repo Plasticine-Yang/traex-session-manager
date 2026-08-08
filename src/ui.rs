@@ -572,9 +572,18 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         )
     };
     let hint = if app.mode == Mode::Search {
-        "  ·  [type] filter  [Enter] keep  [Esc] clear"
+        "  ·  [type] filter  [Enter] keep  [Esc] clear".to_string()
     } else {
-        "  ·  [j/k] move  [Space] select  [*] invert  [d] delete  [/] search  [p] scope  [Tab] lifecycle  [q] quit"
+        // `a` reads as archive in the Active view, unarchive in the Archived
+        // view (spec §5.7 lifecycle gating); label it from the op itself so the
+        // footer can't drift from `archive_op`'s mapping.
+        let archive_verb = match app.archive_op() {
+            crate::mutate::Op::Unarchive => "unarchive",
+            _ => "archive",
+        };
+        format!(
+            "  ·  [j/k] move  [Space] select  [*] invert  [d] delete  [a] {archive_verb}  [/] search  [p] scope  [Tab] lifecycle  [q] quit"
+        )
     };
     let line = Line::from(vec![left, Span::styled(hint, Style::default().fg(theme::DIM))]);
     f.render_widget(line.style(Style::default().bg(theme::BG)), area);

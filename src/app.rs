@@ -335,12 +335,12 @@ impl App {
 
     // --- Delete / batch engine (spec §6) -----------------------------------
 
-    /// The ids `d` will act on (spec §6.3): every selected session if any are
-    /// selected, otherwise just the cursor row. Selection order is not
-    /// meaningful, but the cursor-row fallback and the "list titles" modal need
-    /// a stable order, so selected ids follow current view order (visible first),
-    /// with hidden-but-selected rows appended.
-    pub fn delete_targets(&self) -> Vec<String> {
+    /// The ids a batch op (`d`/`a`) will act on (spec §6.3): every selected
+    /// session if any are selected, otherwise just the cursor row. Selection
+    /// order is not meaningful, but the cursor-row fallback and the "list titles"
+    /// modal need a stable order, so selected ids follow current view order
+    /// (visible first), with hidden-but-selected rows appended.
+    pub fn batch_targets(&self) -> Vec<String> {
         if self.selected.is_empty() {
             return self
                 .selected_session()
@@ -365,11 +365,34 @@ impl App {
     /// `d`: open the delete-confirmation modal for the current targets (spec
     /// §6.3). A no-op when there is nothing to delete (empty view, no selection).
     pub fn request_delete(&mut self) {
-        let ids = self.delete_targets();
+        let ids = self.batch_targets();
         if ids.is_empty() {
             return;
         }
         self.mode = Mode::ConfirmDelete { ids };
+    }
+
+    /// The archive op for the current lifecycle view (spec §3.2 / §5.7): `a`
+    /// archives in the Active view and unarchives in the Archived view. The view
+    /// itself gates against traex's non-idempotent hard error — Active rows only
+    /// ever archive, Archived rows only ever unarchive.
+    pub fn archive_op(&self) -> Op {
+        match self.lifecycle {
+            Lifecycle::Active => Op::Archive,
+            Lifecycle::Archived => Op::Unarchive,
+        }
+    }
+
+    /// `a`: archive (Active view) or unarchive (Archived view) the current
+    /// targets. Reversible, so it is **confirmation-free and fires immediately**
+    /// (spec §6.3) — straight into the batch pipeline, no `ConfirmDelete` gate.
+    /// A no-op when there is nothing to act on (empty view, no selection).
+    pub fn request_archive(&mut self) {
+        let ids = self.batch_targets();
+        if ids.is_empty() {
+            return;
+        }
+        self.start_batch(self.archive_op(), ids);
     }
 
     /// The title to show for an id in the confirm modal, falling back through
@@ -1030,12 +1053,12 @@ mod tests {
     fn delete_targets_selected_else_cursor() {
         let mut app = app_with(3); // cursor on p2 (newest)
         // No selection: just the cursor row.
-        assert_eq!(app.delete_targets(), vec!["p2"]);
+        assert_eq!(app.batch_targets(), vec!["p2"]);
         // With a selection, targets are the selected set (cursor ignored).
         app.cursor_last(); // p0
         app.toggle_selected(); // select p0
         app.cursor_first(); // cursor back on p2, but p2 not selected
-        assert_eq!(app.delete_targets(), vec!["p0"]);
+        assert_eq!(app.batch_targets(), vec!["p0"]);
     }
 
     #[test]
@@ -1143,6 +1166,127 @@ mod tests {
         app.dismiss_result();
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.is_selected("p1"));
+    }
+
+    // --- Archive / unarchive (ticket 06) -----------------------------------
+
+    /// Like [`app_with_batch`], but the runner flips `archived` to match the op
+    /// (archive → 1, unarchive → 0) so the post-batch re-query (spec §6.7)
+    /// reflects the row leaving the current lifecycle view. `fail_ids` still
+    /// return a canned error and leave the row untouched.
+    fn app_with_archive_batch(fail_ids: &[&str]) -> App {
+        let path = unique_db();
+        let _ = std::fs::remove_file(&path);
+        seed(&path, 2); // p0,p1 active in /proj; parch archived in /proj
+        let store = Store::open(path.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        let fails: HashSet<String> = fail_ids.iter().map(|s| s.to_string()).collect();
+        let db = path.clone();
+        let runner: Runner = std::sync::Arc::new(move |op, id| {
+            if fails.contains(id) {
+                return Some(format!("Error: boom {id}"));
+            }
+            let archived = match op {
+                Op::Archive => 1,
+                Op::Unarchive => 0,
+                Op::Delete => panic!("archive test runner got Delete"),
+            };
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE threads SET archived = ?1 WHERE id = ?2",
+                rusqlite::params![archived, id],
+            )
+            .unwrap();
+            None
+        });
+        App::with_runner(store, "/proj".to_string(), rows, runner)
+    }
+
+    #[test]
+    fn archive_op_follows_lifecycle_view() {
+        let mut app = app_with(1);
+        assert_eq!(app.archive_op(), Op::Archive); // Active view
+        app.toggle_lifecycle();
+        assert_eq!(app.archive_op(), Op::Unarchive); // Archived view
+    }
+
+    #[test]
+    fn archive_fires_immediately_without_confirm() {
+        // `a` is reversible → no ConfirmDelete gate; it goes straight to Running
+        // (spec §6.3). Use a gated runner so we can observe Running before it
+        // finishes.
+        let mut app = app_with_archive_batch(&[]);
+        app.request_archive();
+        // No confirm modal — either Running now or already finished on this fast
+        // in-process runner; never ConfirmDelete.
+        assert!(
+            !matches!(app.mode, Mode::ConfirmDelete { .. }),
+            "archive must not open a confirm modal (spec §6.3)"
+        );
+    }
+
+    #[test]
+    fn archive_single_cursor_row_leaves_active_view() {
+        let mut app = app_with_archive_batch(&[]);
+        // No selection: archive acts on the cursor row (p1, newest active).
+        let target = app.selected_session().unwrap().id.clone();
+        app.request_archive();
+        drive(&mut app);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message.as_deref(), Some("Archived 1."));
+        // Full re-query: the archived row is gone from the Active view (spec §6.7).
+        assert!(!app.all_rows.iter().any(|s| s.id == target));
+    }
+
+    #[test]
+    fn archive_batch_selected_all_leave_active_view() {
+        let mut app = app_with_archive_batch(&[]);
+        app.invert_visible_selection(); // select p0,p1
+        app.request_archive();
+        drive(&mut app);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message.as_deref(), Some("Archived 2."));
+        assert!(app.all_rows.is_empty()); // both archived, gone from Active
+        assert_eq!(app.selected_count(), 0); // successes de-selected + pruned
+    }
+
+    #[test]
+    fn unarchive_from_archived_view_leaves_it() {
+        let mut app = app_with_archive_batch(&[]);
+        app.toggle_lifecycle(); // Project · Archived: parch
+        assert_eq!(app.all_rows.len(), 1);
+        assert_eq!(app.archive_op(), Op::Unarchive);
+        app.request_archive(); // acts on cursor row parch
+        drive(&mut app);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message.as_deref(), Some("Unarchived 1."));
+        // parch flipped to active → gone from the Archived view (spec §6.7).
+        assert!(app.all_rows.is_empty());
+    }
+
+    #[test]
+    fn archive_partial_failure_shows_result_and_keeps_failure_selected() {
+        let mut app = app_with_archive_batch(&["p1"]); // p1 fails to archive
+        app.invert_visible_selection(); // p0,p1
+        app.request_archive();
+        drive(&mut app);
+        match &app.mode {
+            Mode::Result { op } => assert_eq!(*op, Op::Archive),
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(app.progress.failed.len(), 1);
+        assert_eq!(app.progress.failed[0].0, "p1");
+        // p0 archived (gone from Active view); p1 stays selected & retryable.
+        assert!(!app.all_rows.iter().any(|s| s.id == "p0"));
+        assert!(app.is_selected("p1"));
+        assert!(!app.is_selected("p0"));
+    }
+
+    #[test]
+    fn archive_noop_on_empty_view() {
+        let mut app = app_with(0);
+        app.request_archive();
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

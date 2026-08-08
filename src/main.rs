@@ -154,6 +154,7 @@ fn handle_key_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char(' ') => app.toggle_selected(),
         KeyCode::Char('*') => app.invert_visible_selection(),
         KeyCode::Char('d') => app.request_delete(),
+        KeyCode::Char('a') => app.request_archive(),
         KeyCode::Char('/') => app.enter_search(),
         // `Esc` clears a committed filter (spec §4.4); harmless when none is set.
         KeyCode::Esc => app.search_clear(),

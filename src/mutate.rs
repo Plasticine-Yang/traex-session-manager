@@ -21,10 +21,9 @@ pub const POOL_SIZE: usize = 4;
 
 /// The three store-changing operations. All three ride the same pipeline; only
 /// the verb, the traex subcommand, and the `--force` flag differ (spec §6.2).
-/// `Archive`/`Unarchive` are wired by ticket 06 — the engine is built reusable
-/// here (this ticket's goal), so they exist ahead of their key bindings.
+/// `Archive`/`Unarchive` are wired to the `a` key by ticket 06, gated by the
+/// lifecycle view (spec §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Op {
     /// `traex delete <uuid> --force` — irreversible, also deletes rollout files.
     Delete,
