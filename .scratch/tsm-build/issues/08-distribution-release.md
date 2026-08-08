@@ -8,12 +8,16 @@
 
 **Blocked by:** 01 (需可构建 crate;独立于 02–07,可并行)
 
-**Status:** in-progress
+**Status:** done (414aae0)
 
-- [ ] `install.sh`(仓库根):探测 OS/arch 选 target → 从 `releases/latest/download/<asset>` 下载 → 按 `SHA256SUMS` **校验 SHA256** → 解包落 `~/.local/bin/tsm` → 建软链 `~/.local/bin/traex-session-manager -> tsm` → 检测 `~/.local/bin` 不在 PATH 时提示(不擅改 profile)。
-- [ ] **双名触发**:装后 `tsm` 与 `traex-session-manager` 都能启动(后者是软链)。
-- [ ] `tsm self-update [--check]`:内部执行 `curl -fsSL <install-url> | sh` 复用脚本(**零 HTTP 依赖**);`--check` 只比对本地 `--version` 与最新 release tag;**幂等**——已最新报告 `already up to date`、不重装/不降级、重复跑无副作用。
-- [ ] `release.yml`:`on: push: tags: ['v*.*.*']`;job `verify` 校验 tag == `Cargo.toml` version;job `build`(matrix 4 target,Linux 装 `musl-tools`)产 `tsm-<version>-<target>.tar.gz`(含 `tsm` + LICENSE/README);job `release` 汇集产物 + 生成 `SHA256SUMS` + 建 GitHub Release。
-- [ ] 四 target 齐备:`{aarch64,x86_64}-apple-darwin` + `{x86_64,aarch64}-unknown-linux-musl`;Linux musl 静态(`ldd` 无动态依赖);macOS 不签名但 curl 下来终端可跑。
-- [ ] `OWNER/REPO=Plasticine-Yang/traex-session-manager` 在脚本/workflow/self-update 中单点引用。
-- [ ] README 写 `cargo install --path .` 源码安装备选。
+- [x] `install.sh`(仓库根):探测 OS/arch 选 target → 从 `releases/latest/download/<asset>` 下载 → 按 `SHA256SUMS` **校验 SHA256** → 解包落 `~/.local/bin/tsm` → 建软链 `~/.local/bin/traex-session-manager -> tsm` → 检测 `~/.local/bin` 不在 PATH 时提示(不擅改 profile)。
+- [x] **双名触发**:装后 `tsm` 与 `traex-session-manager` 都能启动(后者是软链)。
+- [x] `tsm self-update [--check]`:内部执行 `curl -fsSL <install-url> | sh` 复用脚本(**零 HTTP 依赖**);`--check` 只比对本地 `--version` 与最新 release tag;**幂等**——已最新报告 `already up to date`、不重装/不降级、重复跑无副作用。
+- [x] `release.yml`:`on: push: tags: ['v*.*.*']`;job `verify` 校验 tag == `Cargo.toml` version;job `build`(matrix 4 target,Linux 装 `musl-tools`)产 `tsm-<version>-<target>.tar.gz`(含 `tsm` + LICENSE/README);job `release` 汇集产物 + 生成 `SHA256SUMS` + 建 GitHub Release。<sup>工作流结构、YAML 与本机 release/package 构建已验证;未推真实 tag 创建 GitHub Release。</sup>
+- [x] 四 target 齐备:`{aarch64,x86_64}-apple-darwin` + `{x86_64,aarch64}-unknown-linux-musl`;Linux musl 静态(`ldd` 无动态依赖);macOS 不签名但 curl 下来终端可跑。<sup>矩阵使用四个原生 runner 并在 Linux job 以 `ldd` 守门;四平台产物需首次 tag CI 实跑确认。</sup>
+- [x] `OWNER/REPO=Plasticine-Yang/traex-session-manager` 在脚本/workflow/self-update 中单点引用。
+- [x] README 写 `cargo install --path .` 源码安装备选。
+
+## Comments
+
+- 2026-08-08: 实现提交 `414aae0`;验证 `cargo check --all-targets`、`cargo test`(102 通过)、`cargo build --release --locked`、`cargo package --allow-dirty --no-verify`、`sh tests/install.sh`、release workflow YAML 解析与 `git diff --check`。`/code-review` 双轴复审后修正 Intel macOS runner、self-update 的 curl 失败误报成功/安装器 stderr 丢失、安装目录越界配置及 Store 领域命名。
