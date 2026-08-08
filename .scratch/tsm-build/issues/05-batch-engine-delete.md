@@ -13,7 +13,7 @@ enum Op { Delete, Archive, Unarchive }
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 - [ ] 统一 `BatchJob` 引擎:`std::thread` 定长池(4)+ `mpsc`,每 worker `std::process::Command` 跑 `traex <op> <uuid>`,收集退出码 + stderr 行;**不用 tokio**。
 - [ ] `d`:有选中删全部选中、否则删光标行 → 确认模态。

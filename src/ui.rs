@@ -5,10 +5,10 @@
 //! `scope · lifecycle`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Wrap};
 
 use crate::app::{App, EmptyReason, Lifecycle, Mode, Scope};
 use crate::format::{
@@ -26,6 +26,10 @@ mod theme {
     pub const PURPLE: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
     /// Subtle band behind selected rows (spec §5.3), a lift off `BG`.
     pub const SELECT_BG: Color = Color::Rgb(0x2a, 0x2b, 0x3d);
+    /// Success / failure / warning accents for the batch modals (spec §5.6/§6.5).
+    pub const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
+    pub const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
+    pub const YELLOW: Color = Color::Rgb(0xe0, 0xaf, 0x68);
 }
 
 /// Terminal columns below which the preview panel auto-hides (spec §5.1).
@@ -81,6 +85,225 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         draw_footer(f, chunks[2], app);
     }
+
+    // Batch modals overlay the list (spec §6): a centered floating block over
+    // the whole frame (spec §5.5). Only one is active at a time.
+    match &app.mode {
+        Mode::ConfirmDelete { ids } => draw_confirm_delete(f, area, app, ids),
+        Mode::Running { op } => draw_running(f, area, app, *op),
+        Mode::Result { op } => draw_result(f, area, app, *op),
+        _ => {}
+    }
+}
+
+/// Center a `width`×`height` rect inside `area` for a modal overlay.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let [h] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [v] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(h);
+    v
+}
+
+/// Delete-confirmation modal (spec §6.3): title list (first 10 + "and M more"),
+/// count, an irreversible-warning line, and the confirm/cancel hint.
+fn draw_confirm_delete(f: &mut Frame, area: Rect, app: &App, ids: &[String]) {
+    let n = ids.len();
+    // Up to 10 titles, then an overflow line (spec §6.3).
+    let shown = ids.len().min(10);
+    let mut lines: Vec<Line> = Vec::new();
+    for id in &ids[..shown] {
+        lines.push(Line::from(vec![
+            Span::styled("  • ", Style::default().fg(theme::DIM)),
+            Span::styled(
+                truncate_display(&app.title_for(id), area.width.saturating_sub(20) as usize),
+                Style::default().fg(theme::FG),
+            ),
+        ]));
+    }
+    if n > shown {
+        lines.push(Line::from(Span::styled(
+            format!("  … and {} more", n - shown),
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("Delete {n} session{} — irreversible.", plural(n)),
+        Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "This also deletes the rollout files on disk.",
+        Style::default().fg(theme::YELLOW),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[D]", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled(" confirm   ", Style::default().fg(theme::DIM)),
+        Span::styled("[Esc/n]", Style::default().fg(theme::PURPLE)),
+        Span::styled(" cancel", Style::default().fg(theme::DIM)),
+    ]));
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let width = 64.min(area.width);
+    let rect = centered_rect(area, width, height);
+    let block = modal_block(" Confirm delete ", theme::RED);
+    render_modal(f, rect, block, lines);
+}
+
+/// Progress modal (spec §6.5): `Deleting… N/total` + gauge, then the aggregate
+/// `✓ x  ✗ y  ⟳ z` line, then a small failure list. Never renders per-item rows.
+fn draw_running(f: &mut Frame, area: Rect, app: &App, op: crate::mutate::Op) {
+    let p = &app.progress;
+    let ratio = if p.total() == 0 {
+        1.0
+    } else {
+        p.done() as f64 / p.total() as f64
+    };
+    let verb = op.progress_verb();
+    let head = if p.cancelled {
+        format!("{verb}… {}/{}  (finishing in-flight)", p.done(), p.total())
+    } else {
+        format!("{verb}… {}/{}", p.done(), p.total())
+    };
+
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(theme::CYAN).bg(theme::SELECT_BG))
+        .ratio(ratio)
+        .label(head);
+
+    let counts = Line::from(vec![
+        Span::styled(format!("✓ {}", p.succeeded.len()), Style::default().fg(theme::GREEN)),
+        Span::raw("   "),
+        Span::styled(format!("✗ {}", p.failed.len()), Style::default().fg(theme::RED)),
+        Span::raw("   "),
+        Span::styled(format!("⟳ {}", p.in_flight()), Style::default().fg(theme::YELLOW)),
+    ]);
+
+    // Small accumulating failure list at the bottom (spec §6.5), most recent last.
+    let mut fail_lines = failure_lines(&p.failed, area.width);
+    let mut body = vec![counts, Line::from("")];
+    body.append(&mut fail_lines);
+    body.push(Line::from(Span::styled(
+        "[Esc] stop dispatching (in-flight finish)",
+        Style::default().fg(theme::DIM),
+    )));
+
+    let width = 66.min(area.width);
+    let height = (body.len() as u16 + 4).min(area.height);
+    let rect = centered_rect(area, width, height);
+
+    f.render_widget(Clear, rect);
+    let block = modal_block(&format!(" {verb} "), theme::CYAN);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    // Gauge on the first inner row, the rest below.
+    let [gauge_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    f.render_widget(gauge, gauge_area);
+    f.render_widget(
+        Paragraph::new(body).style(Style::default().bg(theme::BG)),
+        body_area,
+    );
+}
+
+/// Result face (spec §6.6): the failed ids + their stderr lines, and the retry
+/// hint. Reached only when a batch had at least one failure.
+fn draw_result(f: &mut Frame, area: Rect, app: &App, op: crate::mutate::Op) {
+    let p = &app.progress;
+    let cancelled = p.cancelled_ids();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{} succeeded, ", p.succeeded.len()),
+            Style::default().fg(theme::GREEN),
+        ),
+        Span::styled(
+            format!("{} failed", p.failed.len()),
+            Style::default().fg(theme::RED),
+        ),
+        Span::styled(
+            if cancelled.is_empty() {
+                String::new()
+            } else {
+                format!(", {} cancelled", cancelled.len())
+            },
+            Style::default().fg(theme::YELLOW),
+        ),
+    ])];
+    lines.push(Line::from(""));
+    lines.append(&mut failure_lines(&p.failed, area.width));
+    // Cancelled/unfired ids are retryable too (spec §6.8); show them dim so the
+    // user knows `d` will re-run them alongside the failures.
+    for id in &cancelled {
+        let short_id: String = id.chars().take(8).collect();
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {short_id}  "), Style::default().fg(theme::DIM)),
+            Span::styled("cancelled — not attempted", Style::default().fg(theme::YELLOW)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[d]", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" retry   ", Style::default().fg(theme::DIM)),
+        Span::styled("[Esc]", Style::default().fg(theme::PURPLE)),
+        Span::styled(" close", Style::default().fg(theme::DIM)),
+    ]));
+
+    let width = 72.min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = centered_rect(area, width, height);
+    let title = if p.failed.is_empty() {
+        format!(" {} — cancelled ", op.progress_verb())
+    } else {
+        format!(" {} — failures ", op.progress_verb())
+    };
+    let block = modal_block(&title, theme::RED);
+    render_modal(f, rect, block, lines);
+}
+
+/// Render the failure list shared by the progress modal and the result face:
+/// one `id: Error…` line per failure (spec §6.5/§6.6), truncated to width.
+fn failure_lines(failed: &[(String, String)], width: u16) -> Vec<Line<'static>> {
+    let w = width.saturating_sub(6) as usize;
+    failed
+        .iter()
+        .map(|(id, err)| {
+            let short_id: String = id.chars().take(8).collect();
+            Line::from(vec![
+                Span::styled(format!("  {short_id}  "), Style::default().fg(theme::DIM)),
+                Span::styled(truncate_display(err, w), Style::default().fg(theme::RED)),
+            ])
+        })
+        .collect()
+}
+
+/// A centered modal block with a colored border and title.
+fn modal_block(title: &str, border: ratatui::style::Color) -> Block<'static> {
+    Block::default()
+        .title(title.to_string())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(theme::BG))
+}
+
+/// Clear the area, draw `block`, and render `lines` inside it.
+fn render_modal(f: &mut Frame, rect: Rect, block: Block, lines: Vec<Line>) {
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(theme::BG)),
+        inner,
+    );
+}
+
+/// `""`/`"s"` suffix for a count.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// `scope · lifecycle` label for the title bar (spec §5.4).
@@ -351,7 +574,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = if app.mode == Mode::Search {
         "  ·  [type] filter  [Enter] keep  [Esc] clear"
     } else {
-        "  ·  [j/k] move  [Space] select  [*] invert  [/] search  [p] scope  [Tab] lifecycle  [q] quit"
+        "  ·  [j/k] move  [Space] select  [*] invert  [d] delete  [/] search  [p] scope  [Tab] lifecycle  [q] quit"
     };
     let line = Line::from(vec![left, Span::styled(hint, Style::default().fg(theme::DIM))]);
     f.render_widget(line.style(Style::default().bg(theme::BG)), area);

@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use ratatui::widgets::TableState;
 
+use crate::mutate::{self, BatchHandle, BatchJob, Op, Runner};
 use crate::store::{Session, Store};
 
 /// Project range of the list (spec §4.3, CONTEXT "Scope"). Two-state toggle.
@@ -33,14 +34,25 @@ pub enum Lifecycle {
 
 /// Input mode (spec §5.5). Because `p`/`Tab`/`Space`/`*` are all printable, live
 /// search has to be a distinct mode or typing would leak into filter keys (spec
-/// §4.4). Later tickets add the mutation/rename/help modes; ticket 03 only needs
-/// Normal ↔ Search.
+/// §4.4). Ticket 05 adds the batch-delete trio (confirm → running → result);
+/// later tickets add rename/help. The `Running`/`Result` modes carry only the
+/// op verb; the live counters and failure list live on [`App`] (they mutate
+/// every frame and are neither cloneable nor cheap to compare).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// Keys act on the filtered set (navigation, toggles, selection).
     Normal,
     /// Live incremental filtering; printable keys edit the search term.
     Search,
+    /// Delete-confirmation modal (spec §6.3): lists the titles about to be
+    /// deleted; uppercase `D` confirms, `Esc`/`n` cancels. Single-delete (no
+    /// selection, just the cursor row) rides the same modal with one item.
+    ConfirmDelete { ids: Vec<String> },
+    /// Blocking progress modal while a batch runs (spec §6.1/§6.5).
+    Running { op: Op },
+    /// Partial-failure result face (spec §6.6): lists failed ids + stderr; `d`
+    /// retries the still-selected failures, `Esc` closes.
+    Result { op: Op },
 }
 
 /// Why the current view has no rows, so the UI can pick the right guidance
@@ -55,6 +67,56 @@ pub enum EmptyReason {
     ArchivedEmpty,
     /// Scope=All, Active, and genuinely no sessions at all.
     NoSessions,
+}
+
+/// Live progress of the in-flight batch, rendered by the progress modal (spec
+/// §6.5) and consumed to build the result face (spec §6.6). `total` is fixed at
+/// launch; the rest accumulate as outcomes stream in.
+#[derive(Debug, Default, Clone)]
+pub struct BatchProgress {
+    /// Every id in this batch, in dispatch order — the source of truth for the
+    /// cancelled/unfired set (spec §6.8), which is `ids − succeeded − failed`.
+    pub ids: Vec<String>,
+    pub succeeded: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    /// `Esc` pressed: dispatch stopped, in-flight workers left to finish (spec §6.8).
+    pub cancelled: bool,
+}
+
+impl BatchProgress {
+    /// Total ids in the batch.
+    pub fn total(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Ids resolved so far (success + failure); `total - done` are still in
+    /// flight or, once cancelled, will never start.
+    pub fn done(&self) -> usize {
+        self.succeeded.len() + self.failed.len()
+    }
+
+    /// In-flight count for the `⟳ z` aggregate (spec §6.5). Zero once cancelled
+    /// (no more dispatch) or complete.
+    pub fn in_flight(&self) -> usize {
+        self.total().saturating_sub(self.done())
+    }
+
+    /// Ids that never ran because dispatch was cancelled (spec §6.8): the batch
+    /// set minus everything that resolved. Meaningful only after a cancelled
+    /// batch finishes; empty on a batch that ran to completion.
+    pub fn cancelled_ids(&self) -> Vec<String> {
+        let resolved: HashSet<&str> = self
+            .succeeded
+            .iter()
+            .map(String::as_str)
+            .chain(self.failed.iter().map(|(id, _)| id.as_str()))
+            .collect();
+        self.ids
+            .iter()
+            .filter(|id| !resolved.contains(id.as_str()))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Application state (spec §5.5, ticket-02 subset).
@@ -90,6 +152,16 @@ pub struct App {
     pub show_preview: bool,
     /// Transient footer message (e.g. a busy re-query that kept stale rows).
     pub message: Option<String>,
+    /// The in-flight batch's outcome stream + cancel switch, live only during
+    /// `Mode::Running` (spec §6.1). Kept off `Mode` because it is neither
+    /// comparable nor cloneable; the visible progress counters live in
+    /// [`BatchProgress`] instead.
+    batch: Option<BatchHandle>,
+    /// Live progress of the running (or just-finished) batch (spec §6.5/§6.6).
+    pub progress: BatchProgress,
+    /// How each op actually runs (spec §6.4). Production spawns `traex`; tests
+    /// inject a deterministic runner.
+    runner: Runner,
     /// Set once `q` / `Ctrl-c` is pressed.
     pub should_quit: bool,
 }
@@ -101,6 +173,17 @@ impl App {
     /// ran, so a startup lock stays a clean fatal exit (spec §11) rather than a
     /// half-drawn TUI.
     pub fn new(store: Store, cwd: String, initial_rows: Vec<Session>) -> Self {
+        Self::with_runner(store, cwd, initial_rows, mutate::traex_runner())
+    }
+
+    /// Build an app with an explicit batch runner (production passes
+    /// [`mutate::traex_runner`]; tests inject a deterministic one).
+    pub fn with_runner(
+        store: Store,
+        cwd: String,
+        initial_rows: Vec<Session>,
+        runner: Runner,
+    ) -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         let mut app = App {
             store,
@@ -116,6 +199,9 @@ impl App {
             selected: HashSet::new(),
             show_preview: true,
             message: None,
+            batch: None,
+            progress: BatchProgress::default(),
+            runner,
             should_quit: false,
         };
         app.rebuild_view();
@@ -245,6 +331,230 @@ impl App {
     /// Count of selected sessions (footer `N selected`, spec §5.4).
     pub fn selected_count(&self) -> usize {
         self.selected.len()
+    }
+
+    // --- Delete / batch engine (spec §6) -----------------------------------
+
+    /// The ids `d` will act on (spec §6.3): every selected session if any are
+    /// selected, otherwise just the cursor row. Selection order is not
+    /// meaningful, but the cursor-row fallback and the "list titles" modal need
+    /// a stable order, so selected ids follow current view order (visible first),
+    /// with hidden-but-selected rows appended.
+    pub fn delete_targets(&self) -> Vec<String> {
+        if self.selected.is_empty() {
+            return self
+                .selected_session()
+                .map(|s| vec![s.id.clone()])
+                .unwrap_or_default();
+        }
+        // Visible selected rows in view order, then any hidden selected rows
+        // (spec §4.5: hidden-but-selected still count).
+        let mut ids: Vec<String> = self
+            .visible_sessions()
+            .filter(|s| self.selected.contains(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in &self.selected {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// `d`: open the delete-confirmation modal for the current targets (spec
+    /// §6.3). A no-op when there is nothing to delete (empty view, no selection).
+    pub fn request_delete(&mut self) {
+        let ids = self.delete_targets();
+        if ids.is_empty() {
+            return;
+        }
+        self.mode = Mode::ConfirmDelete { ids };
+    }
+
+    /// The title to show for an id in the confirm modal, falling back through
+    /// `first_user_message` to `(untitled)` — mirrors the list's display rule.
+    pub fn title_for(&self, id: &str) -> String {
+        match self.all_rows.iter().find(|s| s.id == id) {
+            Some(s) => crate::format::session_display(&s.title, &s.first_user_message),
+            None => id.to_string(),
+        }
+    }
+
+    /// `Esc`/`n` in the confirm modal: back to Normal, selection untouched.
+    pub fn cancel_confirm(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// `D` in the confirm modal: launch the delete batch (spec §6.1/§6.4). The
+    /// confirmed ids drive a `BatchJob`; the fan-out pool starts immediately and
+    /// the modal switches to the blocking progress view.
+    pub fn confirm_delete(&mut self) {
+        let ids = match &self.mode {
+            Mode::ConfirmDelete { ids } => ids.clone(),
+            _ => return,
+        };
+        self.start_batch(Op::Delete, ids);
+    }
+
+    /// Kick off a batch for `op` over `ids`, moving into `Mode::Running` (spec
+    /// §6.2). Shared by delete-confirm and (ticket 06) archive/unarchive, and by
+    /// retry (spec §6.6).
+    pub fn start_batch(&mut self, op: Op, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.progress = BatchProgress {
+            ids: ids.clone(),
+            ..Default::default()
+        };
+        let job = BatchJob { op, ids };
+        self.batch = Some(mutate::spawn(job, self.runner.clone()));
+        self.mode = Mode::Running { op };
+    }
+
+    /// Drain any outcomes the workers have produced and fold them into
+    /// `progress` (spec §6.5). Called each frame while `Mode::Running`; once the
+    /// batch is finished, transitions to the result face or auto-closes (spec
+    /// §6.6). Returns nothing; the caller re-renders from the new state.
+    pub fn poll_batch(&mut self) {
+        let Some(handle) = &self.batch else { return };
+        let finished = handle.is_finished();
+        for out in handle.drain_ready() {
+            match out.error {
+                None => self.progress.succeeded.push(out.id),
+                Some(e) => self.progress.failed.push((out.id, e)),
+            }
+        }
+        // Check `is_finished` *before* draining: a worker can send its last
+        // outcome and then exit between the two calls, so ordering it this way
+        // guarantees the final drain above already saw everything a "finished"
+        // pool produced.
+        if finished {
+            self.finish_batch();
+        }
+    }
+
+    /// `Esc` in the progress modal: stop dispatching, let in-flight finish (spec
+    /// §6.8). The workers still stream their outcomes; `poll_batch` keeps folding
+    /// them until the pool drains.
+    pub fn cancel_batch(&mut self) {
+        if let Some(handle) = &self.batch {
+            handle.cancel();
+            self.progress.cancelled = true;
+        }
+    }
+
+    /// Batch is done (all workers exited): re-query the store once (spec §6.7),
+    /// reconcile the selection (successes drop, failures stay, spec §6.6), and
+    /// either auto-close on full success or show the result face.
+    fn finish_batch(&mut self) {
+        let op = match &self.mode {
+            Mode::Running { op } => *op,
+            _ => return,
+        };
+        self.batch = None;
+
+        // Successes leave the selection; failures stay so `d` can retry them, and
+        // cancelled/unfired ids also stay selected+retryable (spec §6.6/§6.8).
+        for id in &self.progress.succeeded {
+            self.selected.remove(id);
+        }
+
+        // Full re-query so archive's moved files / vanished rows are reflected
+        // authoritatively (spec §6.7); also prunes `selected` of gone rows.
+        self.refresh_after_mutation();
+
+        // Full success on a batch that ran to completion → auto-close with a
+        // toast (spec §6.6). A cancelled batch always shows the result face so
+        // the user sees the unfired set and the `d`-retry hint (spec §6.8), even
+        // if every dispatched worker happened to succeed.
+        if self.progress.failed.is_empty() && !self.progress.cancelled {
+            let n = self.progress.succeeded.len();
+            self.message = Some(format!("{} {}.", op.past_verb(), n));
+            self.mode = Mode::Normal;
+        } else {
+            self.mode = Mode::Result { op };
+        }
+    }
+
+    /// `d` on the result face: retry the still-selected failures **and** any
+    /// cancelled/unfired ids that are still selected, through the same pipeline
+    /// (spec §6.6/§6.8). If nothing is selected anymore, closes.
+    pub fn retry_failed(&mut self) {
+        let op = match &self.mode {
+            Mode::Result { op } => *op,
+            _ => return,
+        };
+        // Both failed and cancelled/unfired ids are retryable (spec §6.8). Dedup
+        // by preserving first-seen order: failures first, then unfired.
+        let mut ids: Vec<String> = Vec::new();
+        for id in self
+            .progress
+            .failed
+            .iter()
+            .map(|(id, _)| id.clone())
+            .chain(self.progress.cancelled_ids())
+        {
+            if self.selected.contains(&id) && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            self.mode = Mode::Normal;
+            return;
+        }
+        self.start_batch(op, ids);
+    }
+
+    /// `Esc` on the result face: close back to Normal, leaving failures selected.
+    pub fn dismiss_result(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// Re-query the current scope×lifecycle after a mutation and prune the
+    /// selection of ids that no longer exist (spec §6.7). Unlike [`requery`],
+    /// this keeps the cursor near where it was (by id) rather than resetting to
+    /// the top, and preserves the transient message. A busy timeout is
+    /// non-fatal.
+    fn refresh_after_mutation(&mut self) {
+        let anchor = self.selected_session().map(|s| s.id.clone());
+        let scope_cwd = match self.scope {
+            Scope::Project => Some(self.cwd.as_str()),
+            Scope::All => None,
+        };
+        let archived = matches!(self.lifecycle, Lifecycle::Archived);
+        match self.store.query(scope_cwd, archived) {
+            Ok(rows) => {
+                self.all_rows = rows;
+                self.rebuild_view();
+                self.prune_selection();
+                self.restore_cursor(anchor.as_deref());
+            }
+            Err(err) => {
+                self.message = Some(err.to_string());
+            }
+        }
+    }
+
+    /// Drop selected ids that are no longer present in `all_rows` (spec §6.7:
+    /// `selected` filters out vanished/changed rows).
+    fn prune_selection(&mut self) {
+        let present: HashSet<&str> = self.all_rows.iter().map(|s| s.id.as_str()).collect();
+        self.selected.retain(|id| present.contains(id.as_str()));
+    }
+
+    /// Put the cursor back on `anchor` if it survives; otherwise clamp to a valid
+    /// row so it never lands on an unrelated session.
+    fn restore_cursor(&mut self, anchor: Option<&str>) {
+        if self.view.is_empty() {
+            self.table.select(None);
+            return;
+        }
+        let idx = anchor
+            .and_then(|id| self.view.iter().position(|&i| self.all_rows[i].id == id))
+            .unwrap_or_else(|| self.table.selected().unwrap_or(0).min(self.view.len() - 1));
+        self.table.select(Some(idx));
     }
 
     /// Re-run the query for the current scope×lifecycle and reset the cursor to
@@ -415,6 +725,42 @@ mod tests {
         let store = Store::open(path.clone()).unwrap();
         let rows = store.query_project_active("/proj").unwrap();
         App::new(store, "/proj".to_string(), rows)
+    }
+
+    /// Like [`app_with`], but injects a batch runner that actually mutates the
+    /// backing DB so the post-batch re-query (spec §6.7) reflects real changes.
+    /// The runner deletes the row from `path` on "success"; ids listed in
+    /// `fail_ids` return a canned error and leave the row in place.
+    fn app_with_batch(n: usize, fail_ids: &[&str]) -> App {
+        let path = unique_db();
+        let _ = std::fs::remove_file(&path);
+        seed(&path, n);
+        let store = Store::open(path.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        let fails: HashSet<String> = fail_ids.iter().map(|s| s.to_string()).collect();
+        let db = path.clone();
+        let runner: Runner = std::sync::Arc::new(move |_op, id| {
+            if fails.contains(id) {
+                return Some(format!("Error: boom {id}"));
+            }
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM threads WHERE id = ?1", rusqlite::params![id])
+                .unwrap();
+            None
+        });
+        App::with_runner(store, "/proj".to_string(), rows, runner)
+    }
+
+    /// Poll the batch to completion (workers are real threads).
+    fn drive(app: &mut App) {
+        for _ in 0..500 {
+            if !matches!(app.mode, Mode::Running { .. }) {
+                return;
+            }
+            app.poll_batch();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("batch did not finish");
     }
 
     #[test]
@@ -676,5 +1022,208 @@ mod tests {
         assert!(app.is_selected(sel_id));
         app.search_clear();
         assert!(app.is_selected(sel_id));
+    }
+
+    // --- Delete / batch engine (ticket 05) ---------------------------------
+
+    #[test]
+    fn delete_targets_selected_else_cursor() {
+        let mut app = app_with(3); // cursor on p2 (newest)
+        // No selection: just the cursor row.
+        assert_eq!(app.delete_targets(), vec!["p2"]);
+        // With a selection, targets are the selected set (cursor ignored).
+        app.cursor_last(); // p0
+        app.toggle_selected(); // select p0
+        app.cursor_first(); // cursor back on p2, but p2 not selected
+        assert_eq!(app.delete_targets(), vec!["p0"]);
+    }
+
+    #[test]
+    fn request_delete_opens_confirm_with_titles() {
+        let mut app = app_with(2);
+        app.request_delete();
+        match &app.mode {
+            Mode::ConfirmDelete { ids } => assert_eq!(ids, &vec!["p1".to_string()]),
+            other => panic!("expected ConfirmDelete, got {other:?}"),
+        }
+        // Single-delete rides the same modal with one item (spec §6.3).
+        assert_eq!(app.title_for("p1"), "p1");
+    }
+
+    #[test]
+    fn request_delete_noop_on_empty_view() {
+        let mut app = app_with(0);
+        app.request_delete();
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn cancel_confirm_returns_to_normal() {
+        let mut app = app_with(2);
+        app.request_delete();
+        app.cancel_confirm();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.all_rows.len(), 2); // nothing deleted
+    }
+
+    #[test]
+    fn full_success_deletes_requeries_and_auto_closes() {
+        let mut app = app_with_batch(3, &[]);
+        app.invert_visible_selection(); // select p0,p1,p2
+        app.request_delete();
+        app.confirm_delete();
+        drive(&mut app);
+        // Auto-closed on full success with a toast (spec §6.6).
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message.as_deref(), Some("Deleted 3."));
+        // All rows gone from the store, selection cleared (spec §6.7).
+        assert!(app.all_rows.is_empty());
+        assert_eq!(app.selected_count(), 0);
+    }
+
+    #[test]
+    fn partial_failure_shows_result_and_keeps_failures_selected() {
+        let mut app = app_with_batch(3, &["p1"]); // p1 fails
+        app.invert_visible_selection(); // select p0,p1,p2
+        app.request_delete();
+        app.confirm_delete();
+        drive(&mut app);
+        // Result face lists the failure (spec §6.6).
+        match &app.mode {
+            Mode::Result { op } => assert_eq!(*op, Op::Delete),
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(app.progress.failed.len(), 1);
+        assert_eq!(app.progress.failed[0].0, "p1");
+        // Successes removed from store + selection; failure stays selected.
+        assert!(app.all_rows.iter().any(|s| s.id == "p1"));
+        assert!(!app.all_rows.iter().any(|s| s.id == "p0"));
+        assert!(app.is_selected("p1"));
+        assert!(!app.is_selected("p0"));
+    }
+
+    #[test]
+    fn retry_reruns_still_selected_failures() {
+        let mut app = app_with_batch(2, &["p1"]);
+        app.invert_visible_selection(); // p0,p1
+        app.request_delete();
+        app.confirm_delete();
+        drive(&mut app);
+        assert!(matches!(app.mode, Mode::Result { .. }));
+        assert!(app.is_selected("p1"));
+        // Retry re-runs the still-selected failure set (spec §6.6). The injected
+        // runner keeps failing p1, so we land back on the result face with p1
+        // still selected — proving retry re-ran the failure through the pipeline.
+        app.retry_failed();
+        drive(&mut app);
+        assert!(matches!(app.mode, Mode::Result { .. }));
+        assert!(app.is_selected("p1"));
+    }
+
+    #[test]
+    fn retry_with_nothing_selected_closes() {
+        let mut app = app_with_batch(2, &["p1"]);
+        app.invert_visible_selection();
+        app.request_delete();
+        app.confirm_delete();
+        drive(&mut app);
+        // Deselect the failure, then retry: nothing to do, close.
+        app.selected.remove("p1");
+        app.retry_failed();
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn dismiss_result_keeps_failures_selected() {
+        let mut app = app_with_batch(2, &["p1"]);
+        app.invert_visible_selection();
+        app.request_delete();
+        app.confirm_delete();
+        drive(&mut app);
+        app.dismiss_result();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.is_selected("p1"));
+    }
+
+    #[test]
+    fn cancel_lands_on_result_even_when_all_dispatched_succeed() {
+        // A gated runner: workers block on a flag so we can cancel while they are
+        // in-flight; released workers all succeed. This proves the spec §6.8
+        // rule that a cancelled batch shows the result face even with zero
+        // failures, and the unfired tail stays selected + retryable.
+        let path = unique_db();
+        let _ = std::fs::remove_file(&path);
+        seed(&path, 0);
+        let conn = Connection::open(&path).unwrap();
+        for i in 0..20 {
+            conn.execute(
+                "INSERT INTO threads (id,title,cwd,updated_at,updated_at_ms,archived,tokens_used)
+                 VALUES (?1,?1,'/proj',?2,?3,0,0)",
+                rusqlite::params![format!("g{i}"), i as i64, i as i64 * 1000],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let store = Store::open(path.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db = path.clone();
+        let g = std::sync::Arc::clone(&gate);
+        let runner: Runner = std::sync::Arc::new(move |_op, id| {
+            while !g.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM threads WHERE id = ?1", rusqlite::params![id])
+                .unwrap();
+            None
+        });
+        let mut app = App::with_runner(store, "/proj".to_string(), rows, runner);
+        app.invert_visible_selection(); // select all 20
+        app.request_delete();
+        app.confirm_delete();
+        // Workers are blocked on the gate; cancel, then release them.
+        app.cancel_batch();
+        gate.store(true, Ordering::Release);
+        drive(&mut app);
+
+        assert!(matches!(app.mode, Mode::Result { .. }), "mode = {:?}", app.mode);
+        assert!(app.progress.cancelled);
+        let unfired = app.progress.cancelled_ids();
+        assert!(!unfired.is_empty(), "expected an unfired tail after cancel");
+        for id in &unfired {
+            assert!(app.is_selected(id), "unfired {id} should stay selected");
+        }
+        // `d` retries the still-selected unfired set through the pipeline.
+        app.retry_failed();
+        assert!(matches!(app.mode, Mode::Running { .. }));
+    }
+
+    #[test]
+    fn progress_aggregates_report_in_flight() {
+        let p = BatchProgress {
+            ids: (0..10).map(|i| i.to_string()).collect(),
+            succeeded: vec!["a".into(), "b".into()],
+            failed: vec![("c".into(), "e".into())],
+            cancelled: false,
+        };
+        assert_eq!(p.total(), 10);
+        assert_eq!(p.done(), 3);
+        assert_eq!(p.in_flight(), 7);
+    }
+
+    #[test]
+    fn cancelled_ids_are_the_unfired_set() {
+        let p = BatchProgress {
+            ids: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            succeeded: vec!["a".into()],
+            failed: vec![("b".into(), "boom".into())],
+            cancelled: true,
+        };
+        // c, d never resolved → cancelled/unfired (spec §6.8).
+        let mut got = p.cancelled_ids();
+        got.sort();
+        assert_eq!(got, vec!["c".to_string(), "d".to_string()]);
     }
 }
