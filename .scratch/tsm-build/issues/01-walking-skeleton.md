@@ -6,7 +6,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** done
+**Status:** done (74febff)
 
 - [x] crate 建好:包名 `traex-session-manager`、`[[bin]] name = "tsm"`、`version = "0.1.0"`、`edition = "2024"`;模块骨架 `store`/`app`/`ui`(`mutate`/`rename` 可留空占位)。
 - [x] 依赖只含 `ratatui` + `crossterm` + `rusqlite{bundled}` + `unicode-width` + 可选 `anyhow`;**无** serde/tokio/HTTP crate。

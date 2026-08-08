@@ -14,14 +14,21 @@ When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the 
 
 Edit the right-hand column to match whatever vocabulary you actually use.
 
-## Completion state (local addition)
+## Lifecycle states (local-markdown)
 
-The five roles above are **triage** vocabulary — they describe an issue *before* implementation starts. They deliberately have no "finished" state: on a hosted tracker (GitHub, Linear) completion is expressed by **closing the issue or merging the PR**, not by a label.
+The five roles above are **triage** vocabulary — they classify an issue *before* work starts. On a hosted tracker (GitHub, Linear) what happens *after* triage is expressed by the platform: you claim an issue by assigning it, and you finish it by closing the issue / merging its PR. This repo's tracker is **local markdown** (see `issue-tracker.md`), which has none of those actions, so the single `Status:` line carries the whole lifecycle:
 
-This repo's tracker is **local markdown** (see `issue-tracker.md`), which has no "close" action, so a completed ticket needs an explicit written signal. We use one extra `Status:` string:
+```
+triage (needs-triage / needs-info / ready-for-agent / ready-for-human) → in-progress → done
+```
 
-| Status | Meaning                                                                                                |
-| ------ | ------------------------------------------------------------------------------------------------------ |
-| `done` | Implementation is complete, verified, and committed. All acceptance `- [ ]` boxes are checked `- [x]`. |
+Two states extend the table beyond triage:
 
-`done` is what the frontier rule keys on: a ticket becomes workable once every ticket in its "Blocked by" list is `done`. It is written on ticket close-out — see the "Closing out a ticket after `/implement`" section in `AGENTS.md`.
+| Status         | Set when                                 | Meaning                                                                                                                             |
+| -------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `in-progress`  | before starting work on the ticket       | Local claim — the ticket is being worked on. Prevents a second session from grabbing the same ticket.                               |
+| `done (<sha>)` | after the work is complete and committed | Finished. The closing commit SHA follows on the same line, e.g. `Status: done (a1b2c3d)` — the local stand-in for a merged-PR link. |
+
+`wontfix` (from the triage table) also terminates a ticket.
+
+**Frontier rule:** a ticket becomes workable once every ticket in its "Blocked by" list is `done`. A ticket counts as "unfinished" for any Status other than `done` or `wontfix`. Claiming and completion happen at ticket close-out — see the "Closing out a ticket after `/implement`" section in `AGENTS.md`.

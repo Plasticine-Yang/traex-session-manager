@@ -7,8 +7,20 @@ Issues and specs for this repo live as markdown files in `.scratch/`.
 - One feature per directory: `.scratch/<feature-slug>/`
 - The spec is `.scratch/<feature-slug>/spec.md`
 - Implementation issues are one file per ticket at `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01` — never a single combined tickets file
-- Triage state is recorded as a `Status:` line near the top of each issue file (see `triage-labels.md` for the role strings)
+- A `Status:` line near the top of each issue file carries its whole lifecycle: `triage → in-progress → done` (see `triage-labels.md` for the strings). Because local markdown has no "assign" or "close/merge" action, `Status:` stands in for both:
+  - **Claim before work:** set `Status: in-progress` and save *before* starting, so a second session doesn't grab the same ticket.
+  - **Complete after commit:** set `Status: done (<sha>)` with the closing commit SHA on the same line, e.g. `Status: done (a1b2c3d)` — the local stand-in for a merged-PR link.
 - Comments and conversation history append to the bottom of the file under a `## Comments` heading
+
+## Scanning for unfinished issues
+
+To see the lifecycle state of every ticket at a glance:
+
+```
+rg -n '^\*{0,2}Status:' .scratch/**/issues/*.md
+```
+
+The `\*{0,2}` matches both the bare `Status:` line (wayfinding tickets) and the `**Status:**` bold form the `/to-tickets` template emits. Anything whose Status is not `done` or `wontfix` is unfinished (i.e. `needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `in-progress`).
 
 ## When a skill says "publish to the issue tracker"
 
