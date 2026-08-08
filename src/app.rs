@@ -5,6 +5,7 @@
 //! the third dimension, Search, plus multi-selection. `scope + lifecycle` decide
 //! the DB query (spec §4.2 seam); `search` + sort work on the in-memory
 //! `all_rows` snapshot instead of re-querying per keystroke (spec §4.2 / R1).
+//! Ticket 07 adds honest manual refresh and the help overlay.
 
 use std::collections::HashSet;
 
@@ -35,7 +36,7 @@ pub enum Lifecycle {
 /// Input mode (spec §5.5). Because `p`/`Tab`/`Space`/`*` are all printable, live
 /// search has to be a distinct mode or typing would leak into filter keys (spec
 /// §4.4). Ticket 05 adds the batch-delete trio (confirm → running → result);
-/// later tickets add rename/help. The `Running`/`Result` modes carry only the
+/// ticket 07 adds help. The `Running`/`Result` modes carry only the
 /// op verb; the live counters and failure list live on [`App`] (they mutate
 /// every frame and are neither cloneable nor cheap to compare).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,8 @@ pub enum Mode {
     /// Partial-failure result face (spec §6.6): lists failed ids + stderr; `d`
     /// retries the still-selected failures, `Esc` closes.
     Result { op: Op },
+    /// Complete v1 key table. Any key closes it (spec §5.7).
+    Help,
 }
 
 /// Why the current view has no rows, so the UI can pick the right guidance
@@ -152,6 +155,9 @@ pub struct App {
     pub show_preview: bool,
     /// Transient footer message (e.g. a busy re-query that kept stale rows).
     pub message: Option<String>,
+    /// Startup PATH probe. A missing `traex` does not block read-only use, but
+    /// the footer keeps mutation unavailability visible (spec §11).
+    pub traex_available: bool,
     /// The in-flight batch's outcome stream + cancel switch, live only during
     /// `Mode::Running` (spec §6.1). Kept off `Mode` because it is neither
     /// comparable nor cloneable; the visible progress counters live in
@@ -173,16 +179,34 @@ impl App {
     /// ran, so a startup lock stays a clean fatal exit (spec §11) rather than a
     /// half-drawn TUI.
     pub fn new(store: Store, cwd: String, initial_rows: Vec<Session>) -> Self {
-        Self::with_runner(store, cwd, initial_rows, mutate::traex_runner())
+        Self::with_runner_and_availability(
+            store,
+            cwd,
+            initial_rows,
+            mutate::traex_runner(),
+            mutate::traex_available(),
+        )
     }
 
     /// Build an app with an explicit batch runner (production passes
     /// [`mutate::traex_runner`]; tests inject a deterministic one).
+    #[cfg(test)]
     pub fn with_runner(
         store: Store,
         cwd: String,
         initial_rows: Vec<Session>,
         runner: Runner,
+    ) -> Self {
+        Self::with_runner_and_availability(store, cwd, initial_rows, runner, true)
+    }
+
+    /// Build an app with explicit mutation execution and PATH-probe state.
+    pub fn with_runner_and_availability(
+        store: Store,
+        cwd: String,
+        initial_rows: Vec<Session>,
+        runner: Runner,
+        traex_available: bool,
     ) -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         let mut app = App {
@@ -199,6 +223,7 @@ impl App {
             selected: HashSet::new(),
             show_preview: true,
             message: None,
+            traex_available,
             batch: None,
             progress: BatchProgress::default(),
             runner,
@@ -260,6 +285,16 @@ impl App {
     /// Toggle the preview panel's visibility intent (`Enter` in Normal, spec §5.7).
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+    }
+
+    /// Open the complete key-reference overlay (`?`, spec §5.7).
+    pub fn show_help(&mut self) {
+        self.mode = Mode::Help;
+    }
+
+    /// Close the help overlay on any key.
+    pub fn dismiss_help(&mut self) {
+        self.mode = Mode::Normal;
     }
 
     // --- Search (spec §4.4) ------------------------------------------------
@@ -486,7 +521,7 @@ impl App {
 
         // Full re-query so archive's moved files / vanished rows are reflected
         // authoritatively (spec §6.7); also prunes `selected` of gone rows.
-        self.refresh_after_mutation();
+        let refreshed = self.refresh_after_mutation();
 
         // Full success on a batch that ran to completion → auto-close with a
         // toast (spec §6.6). A cancelled batch always shows the result face so
@@ -494,7 +529,9 @@ impl App {
         // if every dispatched worker happened to succeed.
         if self.progress.failed.is_empty() && !self.progress.cancelled {
             let n = self.progress.succeeded.len();
-            self.message = Some(format!("{} {}.", op.past_verb(), n));
+            if refreshed {
+                self.message = Some(format!("{} {}.", op.past_verb(), n));
+            }
             self.mode = Mode::Normal;
         } else {
             self.mode = Mode::Result { op };
@@ -540,8 +577,23 @@ impl App {
     /// this keeps the cursor near where it was (by id) rather than resetting to
     /// the top, and preserves the transient message. A busy timeout is
     /// non-fatal.
-    fn refresh_after_mutation(&mut self) {
-        let anchor = self.selected_session().map(|s| s.id.clone());
+    fn refresh_after_mutation(&mut self) -> bool {
+        self.refresh_snapshot(true)
+    }
+
+    /// `R`: re-run the current scope×lifecycle query, preserving every UI
+    /// dimension and restoring the cursor by session id (spec §5.7/§12).
+    pub fn refresh(&mut self) {
+        self.refresh_snapshot(true);
+    }
+
+    /// Re-query the current snapshot. Successful refreshes preserve search and
+    /// selection by id; `keep_cursor` additionally anchors the cursor by id.
+    /// Runtime `SQLITE_BUSY` is non-fatal and leaves `all_rows` untouched.
+    fn refresh_snapshot(&mut self, keep_cursor: bool) -> bool {
+        let anchor = keep_cursor
+            .then(|| self.selected_session().map(|s| s.id.clone()))
+            .flatten();
         let scope_cwd = match self.scope {
             Scope::Project => Some(self.cwd.as_str()),
             Scope::All => None,
@@ -552,10 +604,17 @@ impl App {
                 self.all_rows = rows;
                 self.rebuild_view();
                 self.prune_selection();
-                self.restore_cursor(anchor.as_deref());
+                if keep_cursor {
+                    self.restore_cursor(anchor.as_deref());
+                } else {
+                    self.reset_cursor();
+                }
+                self.message = None;
+                true
             }
             Err(err) => {
-                self.message = Some(err.to_string());
+                self.message = Some(runtime_query_message(&err));
+                false
             }
         }
     }
@@ -584,25 +643,7 @@ impl App {
     /// the top (spec §2.5 / §4.2). A busy timeout is non-fatal: keep the stale
     /// rows and surface a footer message (spec §11 runtime rule).
     fn requery(&mut self) {
-        let scope_cwd = match self.scope {
-            Scope::Project => Some(self.cwd.as_str()),
-            Scope::All => None,
-        };
-        let archived = matches!(self.lifecycle, Lifecycle::Archived);
-        match self.store.query(scope_cwd, archived) {
-            Ok(rows) => {
-                self.all_rows = rows;
-                self.message = None;
-                self.rebuild_view();
-                self.reset_cursor();
-            }
-            Err(err) => {
-                // Runtime transient error (spec §11): non-fatal, keep the stale
-                // rows and surface the message. Manual `R` retry lands in ticket
-                // 07, so don't promise a key that isn't wired yet.
-                self.message = Some(err.to_string());
-            }
-        }
+        self.refresh_snapshot(false);
     }
 
     /// Point the cursor at the first row (or none when empty) after the result
@@ -678,6 +719,16 @@ impl App {
         if !self.view.is_empty() {
             self.table.select(Some(self.view.len() - 1));
         }
+    }
+}
+
+/// Runtime query failures use the actionable busy toast from spec §11 while
+/// retaining useful detail for non-busy errors.
+fn runtime_query_message(err: &anyhow::Error) -> String {
+    if crate::store::is_busy_error(err) {
+        "库忙,按 R 重试".to_string()
+    } else {
+        err.to_string()
     }
 }
 
@@ -1045,6 +1096,91 @@ mod tests {
         assert!(app.is_selected(sel_id));
         app.search_clear();
         assert!(app.is_selected(sel_id));
+    }
+
+    // --- Runtime robustness / refresh / help (ticket 07) -------------------
+
+    #[test]
+    fn manual_refresh_preserves_filters_selection_and_cursor_by_id() {
+        let path = unique_db();
+        let _ = std::fs::remove_file(&path);
+        seed(&path, 3);
+        let store = Store::open(path.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        let mut app = App::new(store, "/proj".to_string(), rows);
+
+        app.toggle_scope(); // All · Active
+        app.enter_search();
+        app.search_push('p');
+        app.search_commit();
+        app.cursor_down();
+        let anchor = app.selected_session().unwrap().id.clone();
+        app.toggle_selected();
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id,title,cwd,updated_at,updated_at_ms,archived,tokens_used)
+             VALUES ('p-new','p-new','/proj',999,999999,0,0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        app.refresh();
+
+        assert_eq!(app.scope, Scope::All);
+        assert_eq!(app.lifecycle, Lifecycle::Active);
+        assert_eq!(app.search, "p");
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.is_selected(&anchor));
+        assert_eq!(app.selected_session().unwrap().id, anchor);
+        assert!(app.all_rows.iter().any(|session| session.id == "p-new"));
+    }
+
+    #[test]
+    fn external_changes_are_invisible_until_manual_refresh() {
+        let path = unique_db();
+        let _ = std::fs::remove_file(&path);
+        seed(&path, 1);
+        let store = Store::open(path.clone()).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        let mut app = App::new(store, "/proj".to_string(), rows);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id,title,cwd,updated_at,updated_at_ms,archived,tokens_used)
+             VALUES ('external','external','/proj',999,999999,0,0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!app.all_rows.iter().any(|session| session.id == "external"));
+        app.refresh();
+        assert!(app.all_rows.iter().any(|session| session.id == "external"));
+    }
+
+    #[test]
+    fn help_opens_and_dismisses_without_changing_view_state() {
+        let mut app = app_with(2);
+        let rows = app.all_rows.len();
+        let cursor = app.table.selected();
+        app.show_help();
+        assert_eq!(app.mode, Mode::Help);
+        app.dismiss_help();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.all_rows.len(), rows);
+        assert_eq!(app.table.selected(), cursor);
+    }
+
+    #[test]
+    fn runtime_busy_message_is_actionable() {
+        let err = anyhow::anyhow!("traex database is busy · try again");
+        assert_eq!(runtime_query_message(&err), "库忙,按 R 重试");
+        assert_eq!(
+            runtime_query_message(&anyhow::anyhow!("disk I/O error")),
+            "disk I/O error"
+        );
     }
 
     // --- Delete / batch engine (ticket 05) ---------------------------------

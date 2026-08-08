@@ -2,7 +2,8 @@
 //! into the two orthogonal filter dimensions: the All view gains a `cwd` column
 //! and drops `tokens`, the Archived view swaps `tokens` for `archived_at`, a
 //! bottom preview panel shows the cursor row, and the title bar reflects
-//! `scope · lifecycle`.
+//! `scope · lifecycle`. Ticket 07 adds the complete-keymap help overlay and
+//! degraded-mode footer status.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -92,6 +93,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::ConfirmDelete { ids } => draw_confirm_delete(f, area, app, ids),
         Mode::Running { op } => draw_running(f, area, app, *op),
         Mode::Result { op } => draw_result(f, area, app, *op),
+        Mode::Help => draw_help(f, area),
         _ => {}
     }
 }
@@ -261,6 +263,43 @@ fn draw_result(f: &mut Frame, area: Rect, app: &App, op: crate::mutate::Op) {
     };
     let block = modal_block(&title, theme::RED);
     render_modal(f, rect, block, lines);
+}
+
+/// Complete v1 key reference from spec §5.7. Rename is included because it is
+/// part of the finalized cross-ticket keymap, even while ticket 04 owns wiring.
+fn draw_help(f: &mut Frame, area: Rect) {
+    let rows = [
+        ("j / ↓ · k / ↑", "move down / up"),
+        ("g / G", "jump to top / bottom"),
+        ("Space", "toggle current selection"),
+        ("*", "invert visible selection"),
+        ("d", "delete selected or current row"),
+        ("a", "archive / unarchive in current lifecycle"),
+        ("r", "rename current row"),
+        ("/", "search"),
+        ("Enter", "keep search / toggle preview"),
+        ("Esc", "clear search / cancel or close"),
+        ("p / Tab", "toggle scope / lifecycle"),
+        ("R", "refresh from database"),
+        ("?", "show this key reference"),
+        ("q / Ctrl-c", "quit"),
+        ("D · Esc / n", "confirm · cancel delete"),
+    ];
+    let mut lines = Vec::with_capacity(rows.len() + 2);
+    for (key, action) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{key:<17}"), Style::default().fg(theme::CYAN)),
+            Span::styled(action, Style::default().fg(theme::FG)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press any key to close",
+        Style::default().fg(theme::DIM),
+    )));
+
+    let rect = centered_rect(area, 62, lines.len() as u16 + 2);
+    render_modal(f, rect, modal_block(" Help ", theme::PURPLE), lines);
 }
 
 /// Render the failure list shared by the progress modal and the result face:
@@ -558,6 +597,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     // the selection count; then the plain row count.
     let left = if let Some(msg) = &app.message {
         Span::styled(msg.clone(), Style::default().fg(theme::PURPLE))
+    } else if !app.traex_available {
+        Span::styled(
+            "traex not found · delete/archive/unarchive unavailable",
+            Style::default().fg(theme::DIM),
+        )
     } else if app.view.is_empty() {
         Span::styled(empty_line(app), Style::default().fg(theme::FG))
     } else if app.selected_count() > 0 {
@@ -582,9 +626,109 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             _ => "archive",
         };
         format!(
-            "  ·  [j/k] move  [Space] select  [*] invert  [d] delete  [a] {archive_verb}  [/] search  [p] scope  [Tab] lifecycle  [q] quit"
+            "  ·  [j/k] move  [Space] select  [d] delete  [a] {archive_verb}  [/] search  [R] refresh  [?] help  [q] quit"
         )
     };
     let line = Line::from(vec![left, Span::styled(hint, Style::default().fg(theme::DIM))]);
     f.render_widget(line.style(Style::default().bg(theme::BG)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mutate::Runner;
+    use crate::store::Store;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn app(traex_available: bool) -> App {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tsm-ui-{}-{}.sqlite",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                updated_at_ms INTEGER,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_branch TEXT,
+                model TEXT,
+                tokens_used INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO threads
+                (id,title,cwd,updated_at,updated_at_ms,archived,tokens_used)
+            VALUES ('one','one','/proj',1,1000,0,0);",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(path).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        let runner: Runner = Arc::new(|_, _| None);
+        App::with_runner_and_availability(
+            store,
+            "/proj".to_string(),
+            rows,
+            runner,
+            traex_available,
+        )
+    }
+
+    fn render_text(app: &mut App) -> String {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_overlay_contains_complete_ticket_key_reference() {
+        let mut app = app(true);
+        app.show_help();
+        let text = render_text(&mut app);
+
+        for expected in [
+            "j / ↓ · k / ↑",
+            "Space",
+            "d",
+            "a",
+            "r",
+            "p / Tab",
+            "R",
+            "?",
+            "q / Ctrl-c",
+        ] {
+            assert!(text.contains(expected), "missing help key {expected:?}");
+        }
+        assert!(text.contains("Press any key to close"));
+    }
+
+    #[test]
+    fn missing_traex_notice_is_visible_without_blocking_render() {
+        let mut app = app(false);
+        let text = render_text(&mut app);
+        assert!(text.contains(
+            "traex not found · delete/archive/unarchive unavailable"
+        ));
+        assert!(text.contains("one"));
+    }
 }

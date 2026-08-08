@@ -10,6 +10,7 @@
 //! async I/O; spec §6.4 / §9.2). The pool size is the R2 ceiling, hardcoded.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -164,6 +165,31 @@ pub fn traex_runner() -> Runner {
     Arc::new(run_traex)
 }
 
+/// Probe whether an executable named `traex` is reachable through `PATH`
+/// without invoking it (spec §11).
+pub fn traex_available() -> bool {
+    command_available("traex", std::env::var_os("PATH").as_deref())
+}
+
+fn command_available(command: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = path else { return false };
+    std::env::split_paths(path).any(|dir| is_executable(&dir.join(command)))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
 /// Run one traex op against one id, returning `None` on success or the error
 /// line on failure.
 fn run_traex(op: Op, id: &str) -> Option<String> {
@@ -201,6 +227,8 @@ fn extract_error(stderr: &[u8], code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -336,6 +364,28 @@ mod tests {
             "Error: traex exited with status 2"
         );
         assert_eq!(extract_error(b"   ", None), "Error: traex terminated by signal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_probe_requires_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("tsm-traex-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("traex");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(&root);
+
+        assert!(command_available("traex", Some(path.as_os_str())));
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!command_available("traex", Some(path.as_os_str())));
+        assert!(!command_available("traex", None));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

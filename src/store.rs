@@ -9,6 +9,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
 
+/// Startup-facing busy text (spec §11).
+const BUSY_MESSAGE: &str = "traex database is busy · try again";
+
 /// The `threads` projection shared by every list query (spec §2.3/§2.5); the
 /// only per-query difference is the trailing `WHERE` / `ORDER BY`.
 const SELECT_SESSION: &str = "SELECT id,title,first_user_message,cwd,updated_at,updated_at_ms,\
@@ -205,9 +208,14 @@ fn map_busy(err: rusqlite::Error) -> anyhow::Error {
     if let rusqlite::Error::SqliteFailure(e, _) = &err
         && e.code == rusqlite::ErrorCode::DatabaseBusy
     {
-        return anyhow!("traex database is busy · try again");
+        return anyhow!(BUSY_MESSAGE);
     }
     anyhow::Error::new(err).context("querying threads")
+}
+
+/// Whether a query error is the normalized `SQLITE_BUSY` timeout.
+pub fn is_busy_error(err: &anyhow::Error) -> bool {
+    err.to_string() == BUSY_MESSAGE
 }
 
 /// Open a read-only connection with the exact flags/pragmas from spec §2.4,

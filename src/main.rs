@@ -136,6 +136,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::ConfirmDelete { .. } => handle_key_confirm(app, key),
         Mode::Running { .. } => handle_key_running(app, key),
         Mode::Result { .. } => handle_key_result(app, key),
+        Mode::Help => app.dismiss_help(),
     }
 }
 
@@ -156,6 +157,8 @@ fn handle_key_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => app.request_delete(),
         KeyCode::Char('a') => app.request_archive(),
         KeyCode::Char('/') => app.enter_search(),
+        KeyCode::Char('R') => app.refresh(),
+        KeyCode::Char('?') => app.show_help(),
         // `Esc` clears a committed filter (spec §4.4); harmless when none is set.
         KeyCode::Esc => app.search_clear(),
         KeyCode::Enter => app.toggle_preview(),
@@ -204,5 +207,77 @@ fn handle_key_result(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => app.retry_failed(),
         KeyCode::Esc => app.dismiss_result(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn app() -> App {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tsm-main-{}-{}.sqlite",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                updated_at_ms INTEGER,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_branch TEXT,
+                model TEXT,
+                tokens_used INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO threads
+                (id,title,cwd,updated_at,updated_at_ms,archived,tokens_used)
+            VALUES ('one','one','/proj',1,1000,0,0);",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(path).unwrap();
+        let rows = store.query_project_active("/proj").unwrap();
+        App::with_runner_and_availability(
+            store,
+            "/proj".to_string(),
+            rows,
+            std::sync::Arc::new(|_, _| None),
+            true,
+        )
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn normal_mode_wires_refresh_and_help() {
+        let mut app = app();
+        app.message = Some("stale".to_string());
+        handle_key(&mut app, key(KeyCode::Char('R')));
+        assert_eq!(app.message, None);
+
+        handle_key(&mut app, key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn help_esc_also_dismisses() {
+        let mut app = app();
+        app.show_help();
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
     }
 }
