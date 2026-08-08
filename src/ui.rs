@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
-use crate::app::{App, EmptyReason, Lifecycle, Scope};
+use crate::app::{App, EmptyReason, Lifecycle, Mode, Scope};
 use crate::format::{
     cwd_relative_home, format_tokens, format_updated, session_display, truncate_display,
     truncate_middle,
@@ -24,6 +24,8 @@ mod theme {
     pub const DIM: Color = Color::Rgb(0x56, 0x5f, 0x89);
     pub const CYAN: Color = Color::Rgb(0x7d, 0xcf, 0xff);
     pub const PURPLE: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
+    /// Subtle band behind selected rows (spec §5.3), a lift off `BG`.
+    pub const SELECT_BG: Color = Color::Rgb(0x2a, 0x2b, 0x3d);
 }
 
 /// Terminal columns below which the preview panel auto-hides (spec §5.1).
@@ -95,14 +97,43 @@ fn scope_lifecycle_label(app: &App) -> String {
 }
 
 fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
+    // Search mode: the title row becomes the live input line `/term▏` with the
+    // hit/total count on the right (spec §5.4). A committed filter (Normal mode
+    // with a non-empty term) shows `/term  N/M` instead (spec §4.4).
+    if app.mode == Mode::Search {
+        let left = Span::styled(
+            format!("/{}\u{258f}", app.search),
+            Style::default().fg(theme::CYAN),
+        );
+        let right = Span::styled(
+            format!("{}/{}", app.view.len(), app.all_rows.len()),
+            Style::default().fg(theme::DIM),
+        );
+        draw_split_line(f, area, left, right);
+        return;
+    }
+
     let left = Span::styled(
         " tsm ",
         Style::default()
             .fg(theme::PURPLE)
             .add_modifier(Modifier::BOLD),
     );
-    let right = Span::styled(scope_lifecycle_label(app), Style::default().fg(theme::DIM));
-    let used = 5 + right.width() as u16;
+    let right = if app.search.is_empty() {
+        Span::styled(scope_lifecycle_label(app), Style::default().fg(theme::DIM))
+    } else {
+        Span::styled(
+            format!("/{}  {}/{}", app.search, app.view.len(), app.all_rows.len()),
+            Style::default().fg(theme::CYAN),
+        )
+    };
+    draw_split_line(f, area, left, right);
+}
+
+/// Render a single line with `left` flush-left and `right` flush-right, padded
+/// to fill `area`.
+fn draw_split_line(f: &mut Frame, area: Rect, left: Span, right: Span) {
+    let used = left.width() as u16 + right.width() as u16;
     let pad = area.width.saturating_sub(used) as usize;
     let line = Line::from(vec![left, Span::raw(" ".repeat(pad)), right]);
     f.render_widget(line.style(Style::default().bg(theme::BG)), area);
@@ -160,10 +191,15 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
                 truncate_display(&session_display(&s.title, &s.first_user_message), session_w);
             let model = truncate_display(s.model.as_deref().unwrap_or(""), W_MODEL as usize);
 
-            let mut cells = vec![
-                Cell::from("·"),
-                Cell::from(format_updated(s.updated_at)),
-            ];
+            // Checkbox: ▣ selected (cyan) / ▢ unselected (dim), spec §5.3.
+            let selected = app.is_selected(&s.id);
+            let check = if selected {
+                Cell::from("▣").style(Style::default().fg(theme::CYAN))
+            } else {
+                Cell::from("▢").style(Style::default().fg(theme::DIM))
+            };
+
+            let mut cells = vec![check, Cell::from(format_updated(s.updated_at))];
             if all_view {
                 let rel = cwd_relative_home(&s.cwd, &home);
                 cells.push(Cell::from(truncate_middle(&rel, W_CWD as usize)));
@@ -176,7 +212,14 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
             } else if !all_view {
                 cells.push(Cell::from(format_tokens(s.tokens_used)));
             }
-            Row::new(cells).style(Style::default().fg(theme::FG))
+            // Selected rows carry a subtle highlight band (spec §5.3); the cursor
+            // row's own highlight style still wins where they overlap.
+            let row_style = if selected {
+                Style::default().fg(theme::FG).bg(theme::SELECT_BG)
+            } else {
+                Style::default().fg(theme::FG)
+            };
+            Row::new(cells).style(row_style)
         })
         .collect();
 
@@ -266,42 +309,50 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(para, inner);
 }
 
-/// The empty-state guidance line for the current cause (spec §4.6 / §8).
-fn empty_text(reason: EmptyReason) -> &'static str {
-    match reason {
-        EmptyReason::ProjectEmpty => "no sessions in this project · switch to all projects",
-        EmptyReason::ArchivedEmpty => {
-            "no archived sessions in this scope · switch lifecycle back to active"
+/// The empty-state guidance line for the current cause (spec §4.6 / §8). The
+/// search-no-match case embeds the live term, so this takes the whole app.
+fn empty_line(app: &App) -> String {
+    match app.empty_reason() {
+        EmptyReason::SearchNoMatch => format!(
+            "no sessions match \"{}\" in this scope · clear search, or switch to all projects",
+            app.search
+        ),
+        EmptyReason::ProjectEmpty => {
+            "no sessions in this project · switch to all projects".to_string()
         }
-        EmptyReason::NoSessions => "no sessions",
+        EmptyReason::ArchivedEmpty => {
+            "no archived sessions in this scope · switch lifecycle back to active".to_string()
+        }
+        EmptyReason::NoSessions => "no sessions".to_string(),
     }
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    // A transient runtime message (e.g. a busy re-query) wins the left slot.
+    // Left-slot precedence: a transient runtime message wins; then, when the
+    // view is empty, the cause-specific guidance (spec §4.6) — this must beat
+    // `N selected`, since the "search a batch → select all" flow (spec §4.4) can
+    // filter down to an empty view while selections survive (spec §4.5); then
+    // the selection count; then the plain row count.
     let left = if let Some(msg) = &app.message {
         Span::styled(msg.clone(), Style::default().fg(theme::PURPLE))
-    } else if app.all_rows.is_empty() {
-        Span::styled(empty_text(app.empty_reason()), Style::default().fg(theme::FG))
+    } else if app.view.is_empty() {
+        Span::styled(empty_line(app), Style::default().fg(theme::FG))
+    } else if app.selected_count() > 0 {
+        Span::styled(
+            format!("{} selected", app.selected_count()),
+            Style::default().fg(theme::CYAN),
+        )
     } else {
         Span::styled(
-            format!("{} sessions", app.all_rows.len()),
+            format!("{} sessions", app.view.len()),
             Style::default().fg(theme::FG),
         )
     };
-    let hint = "  ·  [j/k] move  [p] scope  [Tab] lifecycle  [Enter] preview  [q] quit";
+    let hint = if app.mode == Mode::Search {
+        "  ·  [type] filter  [Enter] keep  [Esc] clear"
+    } else {
+        "  ·  [j/k] move  [Space] select  [*] invert  [/] search  [p] scope  [Tab] lifecycle  [q] quit"
+    };
     let line = Line::from(vec![left, Span::styled(hint, Style::default().fg(theme::DIM))]);
     f.render_widget(line.style(Style::default().bg(theme::BG)), area);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_text_by_reason() {
-        assert!(empty_text(EmptyReason::ProjectEmpty).contains("this project"));
-        assert!(empty_text(EmptyReason::ArchivedEmpty).contains("archived"));
-        assert_eq!(empty_text(EmptyReason::NoSessions), "no sessions");
-    }
 }

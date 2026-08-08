@@ -1,9 +1,12 @@
 //! App — the in-memory state machine behind the UI (spec §5.5).
 //!
-//! Ticket 02 adds the two orthogonal filter dimensions — Scope (Project ↔ All)
-//! and Lifecycle (Active ↔ Archived) — plus the preview toggle. `scope +
-//! lifecycle` decide the DB query (spec §4.2 seam); `search`/sort still land in
-//! later tickets on the in-memory snapshot.
+//! Ticket 02 added the two orthogonal filter dimensions — Scope (Project ↔ All)
+//! and Lifecycle (Active ↔ Archived) — plus the preview toggle. Ticket 03 adds
+//! the third dimension, Search, plus multi-selection. `scope + lifecycle` decide
+//! the DB query (spec §4.2 seam); `search` + sort work on the in-memory
+//! `all_rows` snapshot instead of re-querying per keystroke (spec §4.2 / R1).
+
+use std::collections::HashSet;
 
 use ratatui::widgets::TableState;
 
@@ -28,10 +31,24 @@ pub enum Lifecycle {
     Archived,
 }
 
+/// Input mode (spec §5.5). Because `p`/`Tab`/`Space`/`*` are all printable, live
+/// search has to be a distinct mode or typing would leak into filter keys (spec
+/// §4.4). Later tickets add the mutation/rename/help modes; ticket 03 only needs
+/// Normal ↔ Search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// Keys act on the filtered set (navigation, toggles, selection).
+    Normal,
+    /// Live incremental filtering; printable keys edit the search term.
+    Search,
+}
+
 /// Why the current view has no rows, so the UI can pick the right guidance
-/// (spec §4.6 / §8). Search-driven emptiness arrives in a later ticket.
+/// (spec §4.6 / §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmptyReason {
+    /// A committed/live search matched nothing in this scope (spec §4.6).
+    SearchNoMatch,
     /// Scope=Project, Active, nothing here — offer switching to all projects.
     ProjectEmpty,
     /// Lifecycle=Archived, nothing archived in this scope.
@@ -58,6 +75,16 @@ pub struct App {
     pub scope: Scope,
     /// Lifecycle band (spec §4.3).
     pub lifecycle: Lifecycle,
+    /// Case-insensitive substring filter over `title` + `first_user_message`
+    /// (spec §4.3). Empty string means search is off. Applied in memory over
+    /// `all_rows` (spec §4.2 seam).
+    pub search: String,
+    /// Input mode (spec §5.5); gates whether printable keys edit `search` or act
+    /// as filter/selection keys.
+    pub mode: Mode,
+    /// Multi-selection, keyed by session id so it survives filter re-orders and
+    /// refreshes (spec §4.5 / §5.3). Hidden-but-selected rows stay in the set.
+    pub selected: HashSet<String>,
     /// User's preview-panel intent (spec §5.1); the UI additionally auto-hides
     /// it when the terminal is narrower than 100 columns.
     pub show_preview: bool,
@@ -84,6 +111,9 @@ impl App {
             home,
             scope: Scope::Project,
             lifecycle: Lifecycle::Active,
+            search: String::new(),
+            mode: Mode::Normal,
+            selected: HashSet::new(),
             show_preview: true,
             message: None,
             should_quit: false,
@@ -92,10 +122,23 @@ impl App {
         app
     }
 
-    /// Recompute `view` from `all_rows`. Ticket 02 has no in-memory search yet,
-    /// so `view` is the identity mapping over the (already sorted) query result.
+    /// Recompute `view` from `all_rows`, applying the in-memory search filter
+    /// (spec §4.2 seam). `all_rows` is already scope×lifecycle-filtered and
+    /// sorted by the query; search is a case-insensitive substring test over
+    /// `title` + `first_user_message` (spec §4.3, non-fuzzy).
     pub fn rebuild_view(&mut self) {
-        self.view = (0..self.all_rows.len()).collect();
+        if self.search.is_empty() {
+            self.view = (0..self.all_rows.len()).collect();
+        } else {
+            let needle = self.search.to_lowercase();
+            self.view = self
+                .all_rows
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| session_matches(s, &needle))
+                .map(|(i, _)| i)
+                .collect();
+        }
         self.clamp_cursor();
     }
 
@@ -131,6 +174,77 @@ impl App {
     /// Toggle the preview panel's visibility intent (`Enter` in Normal, spec §5.7).
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+    }
+
+    // --- Search (spec §4.4) ------------------------------------------------
+
+    /// Enter Search mode (`/`), keeping any current term so `/` re-opens editing
+    /// with the committed word (spec §4.4).
+    pub fn enter_search(&mut self) {
+        self.mode = Mode::Search;
+    }
+
+    /// Append a typed character to the search term and re-filter live (spec §4.4).
+    pub fn search_push(&mut self, c: char) {
+        self.search.push(c);
+        self.rebuild_view();
+    }
+
+    /// Delete the last character of the search term and re-filter (spec §4.4).
+    pub fn search_backspace(&mut self) {
+        self.search.pop();
+        self.rebuild_view();
+    }
+
+    /// Commit the search: keep the filter, return to Normal (`Enter` in Search).
+    /// The filtered set stays live so `*`/`Space`/`d` act on it (spec §4.4).
+    pub fn search_commit(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// Clear the search term and return to Normal. Used by `Esc` in Search mode
+    /// and by `Esc` in Normal when a committed filter is present (spec §4.4).
+    pub fn search_clear(&mut self) {
+        self.search.clear();
+        self.mode = Mode::Normal;
+        self.rebuild_view();
+    }
+
+    // --- Multi-selection (spec §4.5 / §5.3) --------------------------------
+
+    /// Toggle selection of the cursor row (`Space`), keyed by session id so the
+    /// choice survives filter re-orders (spec §5.3).
+    pub fn toggle_selected(&mut self) {
+        if let Some(id) = self.selected_session().map(|s| s.id.clone()) {
+            self.toggle_id(id);
+        }
+    }
+
+    /// Invert selection over the currently visible (filtered) set (`*`, spec
+    /// §5.3). Hidden-but-selected rows are untouched (spec §4.5).
+    pub fn invert_visible_selection(&mut self) {
+        let visible_ids: Vec<String> =
+            self.visible_sessions().map(|s| s.id.clone()).collect();
+        for id in visible_ids {
+            self.toggle_id(id);
+        }
+    }
+
+    /// Flip one id's membership in the selection set.
+    fn toggle_id(&mut self, id: String) {
+        if !self.selected.remove(&id) {
+            self.selected.insert(id);
+        }
+    }
+
+    /// Whether the given session id is selected (for row rendering).
+    pub fn is_selected(&self, id: &str) -> bool {
+        self.selected.contains(id)
+    }
+
+    /// Count of selected sessions (footer `N selected`, spec §5.4).
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
     }
 
     /// Re-run the query for the current scope×lifecycle and reset the cursor to
@@ -170,7 +284,13 @@ impl App {
     }
 
     /// Classify why the current view is empty, for the guidance text (spec §4.6 / §8).
+    ///
+    /// Search-driven emptiness wins: if a term is active but nothing matched,
+    /// the guidance is about the search, not the scope/lifecycle band.
     pub fn empty_reason(&self) -> EmptyReason {
+        if !self.search.is_empty() {
+            return EmptyReason::SearchNoMatch;
+        }
         match (self.scope, self.lifecycle) {
             (_, Lifecycle::Archived) => EmptyReason::ArchivedEmpty,
             (Scope::Project, Lifecycle::Active) => EmptyReason::ProjectEmpty,
@@ -226,6 +346,13 @@ impl App {
             self.table.select(Some(self.view.len() - 1));
         }
     }
+}
+
+/// Case-insensitive substring match of `needle` against a session's `title` +
+/// `first_user_message` (spec §4.3). `needle` must already be lowercased.
+fn session_matches(s: &Session, needle: &str) -> bool {
+    s.title.to_lowercase().contains(needle)
+        || s.first_user_message.to_lowercase().contains(needle)
 }
 
 #[cfg(test)]
@@ -417,5 +544,137 @@ mod tests {
         assert_eq!(app.selected_session().unwrap().id, "p2");
         app.cursor_last();
         assert_eq!(app.selected_session().unwrap().id, "p0");
+    }
+
+    // --- Search (ticket 03) ------------------------------------------------
+
+    #[test]
+    fn search_filters_title_case_insensitively() {
+        // /proj active rows are titled "0","1"; add a searchable one via /elsewhere? No —
+        // use the All view where titles like "OactTitle" exist.
+        let mut app = app_with(2);
+        app.toggle_scope(); // All · Active: p0,p1,oact
+        app.enter_search();
+        for c in "oact".chars() {
+            app.search_push(c);
+        }
+        let ids: Vec<_> = app.visible_sessions().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["oact"]);
+        // Case-insensitive: uppercasing the needle still matches.
+        app.search_clear();
+        app.enter_search();
+        for c in "OACT".chars() {
+            app.search_push(c);
+        }
+        let ids: Vec<_> = app.visible_sessions().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["oact"]);
+    }
+
+    #[test]
+    fn search_matches_first_user_message() {
+        let mut app = app_with(2);
+        // Seed has empty first_user_message for p*, so inject via all_rows directly.
+        app.all_rows[0].first_user_message = "hello WORLD dump".to_string();
+        app.enter_search();
+        for c in "world".chars() {
+            app.search_push(c);
+        }
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.visible_sessions().next().unwrap().id, app.all_rows[0].id);
+    }
+
+    #[test]
+    fn search_commit_keeps_filter_esc_clears() {
+        let mut app = app_with(2);
+        app.toggle_scope();
+        app.enter_search();
+        for c in "oact".chars() {
+            app.search_push(c);
+        }
+        app.search_commit();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.search, "oact");
+        assert_eq!(app.view.len(), 1); // filter still live in Normal
+        app.search_clear();
+        assert_eq!(app.search, "");
+        assert_eq!(app.view.len(), 3); // full All·Active set restored
+    }
+
+    #[test]
+    fn search_backspace_re_widens() {
+        let mut app = app_with(2);
+        app.toggle_scope();
+        app.enter_search();
+        for c in "oactx".chars() {
+            app.search_push(c);
+        }
+        assert!(app.view.is_empty());
+        app.search_backspace(); // "oact"
+        assert_eq!(app.view.len(), 1);
+    }
+
+    #[test]
+    fn search_no_match_empty_reason() {
+        let mut app = app_with(2);
+        app.enter_search();
+        for c in "zzz".chars() {
+            app.search_push(c);
+        }
+        assert!(app.view.is_empty());
+        assert_eq!(app.empty_reason(), EmptyReason::SearchNoMatch);
+    }
+
+    // --- Multi-selection (ticket 03) ---------------------------------------
+
+    #[test]
+    fn space_toggles_cursor_row_by_id() {
+        let mut app = app_with(3); // cursor on p2
+        app.toggle_selected();
+        assert!(app.is_selected("p2"));
+        assert_eq!(app.selected_count(), 1);
+        app.toggle_selected();
+        assert!(!app.is_selected("p2"));
+        assert_eq!(app.selected_count(), 0);
+    }
+
+    #[test]
+    fn invert_visible_toggles_filtered_set_only() {
+        let mut app = app_with(3);
+        app.invert_visible_selection(); // select p0,p1,p2
+        assert_eq!(app.selected_count(), 3);
+        // Narrow with search to just one row, then invert: only visible row flips.
+        app.enter_search();
+        for c in "2".chars() {
+            app.search_push(c);
+        }
+        // Title of p2 is "2"; only p2 visible.
+        assert_eq!(app.view.len(), 1);
+        app.invert_visible_selection(); // p2 flips off; p0,p1 untouched (hidden)
+        assert!(!app.is_selected("p2"));
+        assert!(app.is_selected("p0"));
+        assert!(app.is_selected("p1"));
+        assert_eq!(app.selected_count(), 2);
+    }
+
+    #[test]
+    fn selection_survives_filter_and_scope_changes() {
+        let mut app = app_with(2); // p0,p1
+        app.toggle_selected(); // select cursor (p1, newest)
+        let sel_id = "p1";
+        assert!(app.is_selected(sel_id));
+        // Switch scope to All and back — selection is by id, silently preserved.
+        app.toggle_scope();
+        assert!(app.is_selected(sel_id));
+        app.toggle_scope();
+        assert!(app.is_selected(sel_id));
+        // Search hides it, but it stays in the set (spec §4.5, silent retain).
+        app.enter_search();
+        for c in "zzz".chars() {
+            app.search_push(c);
+        }
+        assert!(app.view.is_empty());
+        assert!(app.is_selected(sel_id));
+        app.search_clear();
+        assert!(app.is_selected(sel_id));
     }
 }

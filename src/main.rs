@@ -22,6 +22,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use app::App;
+use app::Mode;
 use store::Store;
 
 fn main() {
@@ -114,8 +115,18 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Map a key press to a state transition (spec §5.7, ticket-01 subset).
+/// Map a key press to a state transition (spec §5.7). Dispatch is
+/// mode-dependent: in Search mode printable keys edit the term (spec §4.4), so
+/// only the two modes' key tables must not overlap on those keys.
 fn handle_key(app: &mut App, key: KeyEvent) {
+    match app.mode {
+        Mode::Normal => handle_key_normal(app, key),
+        Mode::Search => handle_key_search(app, key),
+    }
+}
+
+/// Normal-mode keys: navigation, filter toggles, selection, search entry (spec §5.7).
+fn handle_key_normal(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('c') if ctrl => app.should_quit = true,
@@ -126,7 +137,28 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('G') => app.cursor_last(),
         KeyCode::Char('p') => app.toggle_scope(),
         KeyCode::Tab => app.toggle_lifecycle(),
+        KeyCode::Char(' ') => app.toggle_selected(),
+        KeyCode::Char('*') => app.invert_visible_selection(),
+        KeyCode::Char('/') => app.enter_search(),
+        // `Esc` clears a committed filter (spec §4.4); harmless when none is set.
+        KeyCode::Esc => app.search_clear(),
         KeyCode::Enter => app.toggle_preview(),
+        _ => {}
+    }
+}
+
+/// Search-mode keys: printable input edits the term with live filtering; only
+/// `↑`/`↓` move the cursor, `Enter` commits, `Esc` clears (spec §4.4).
+fn handle_key_search(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        KeyCode::Down => app.cursor_down(),
+        KeyCode::Up => app.cursor_up(),
+        KeyCode::Enter => app.search_commit(),
+        KeyCode::Esc => app.search_clear(),
+        KeyCode::Backspace => app.search_backspace(),
+        KeyCode::Char(c) => app.search_push(c),
         _ => {}
     }
 }

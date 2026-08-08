@@ -6,7 +6,7 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 - [ ] `/` 进入 Search 模式,实时增量过滤;搜索在**内存快照**上做(`to_lowercase().contains()`),**不重查库**(遵守短读 seam)。
 - [ ] 匹配覆盖 `title` + `first_user_message`,大小写不敏感子串(**非 fuzzy**)。
